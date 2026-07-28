@@ -1,0 +1,65 @@
+{
+  "name": "copy-cpp-debug-variable",
+  "displayName": "Copy Cpp Debug Variable",
+  "description": "Copy cpp variable recursively in JSON",
+  "version": "0.0.1",
+  "engines": {
+    "vscode": "^1.125.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "copy-cpp-debug-variable.copyAsJson",
+        "title": "Copy Debug Variable as JSON"
+      },
+      {
+        "command": "copy-cpp-debug-variable.saveAsJson",
+        "title": "Save Debug Variable as JSON"
+      }
+    ],
+    "configuration": {
+      "title": "Copy Cpp Debug Variable",
+      "properties": {
+        "copy-cpp-debug-variable.maxDepth": { "type": "number", "default": 32, "minimum": 1 },
+        "copy-cpp-debug-variable.maxVariables": { "type": "number", "default": 10000, "minimum": 1 },
+        "copy-cpp-debug-variable.maxArrayItems": { "type": "number", "default": 1000, "minimum": 1 },
+        "copy-cpp-debug-variable.variablePagingSize": { "type": "number", "default": 100, "minimum": 1, "maximum": 1000 }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "pnpm run package",
+    "compile": "pnpm run check-types && pnpm run lint && node esbuild.js",
+    "watch": "npm-run-all -p watch:*",
+    "watch:esbuild": "node esbuild.js --watch",
+    "watch:tsc": "tsc --noEmit --watch --project tsconfig.json",
+    "package": "pnpm run check-types && pnpm run lint && node esbuild.js --production",
+    "compile-tests": "tsc -p . --outDir out",
+    "watch-tests": "tsc -p . -w --outDir out",
+    "pretest": "pnpm run compile-tests && pnpm run compile && pnpm run lint",
+    "check-types": "tsc --noEmit",
+    "lint": "eslint src",
+    "test": "vscode-test"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.125.0",
+    "@types/mocha": "^10.0.10",
+    "@types/node": "24.x",
+    "typescript-eslint": "^8.61.1",
+    "eslint": "^10.5.0",
+    "esbuild": "^0.28.1",
+    "npm-run-all": "^4.1.5",
+    "typescript": "^6.0.3",
+    "@vscode/test-cli": "^0.0.15",
+    "@vscode/test-electron": "^3.0.0"
+  },
+  "overrides": {
+    "diff": "^8.0.4",
+    "serialize-javascript": "^7.0.6"
+  }
+}
