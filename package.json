@@ -25,10 +25,27 @@
     "configuration": {
       "title": "Copy Cpp Debug Variable",
       "properties": {
-        "copy-cpp-debug-variable.maxDepth": { "type": "number", "default": 32, "minimum": 1 },
-        "copy-cpp-debug-variable.maxVariables": { "type": "number", "default": 10000, "minimum": 1 },
-        "copy-cpp-debug-variable.maxArrayItems": { "type": "number", "default": 1000, "minimum": 1 },
-        "copy-cpp-debug-variable.variablePagingSize": { "type": "number", "default": 100, "minimum": 1, "maximum": 1000 }
+        "copy-cpp-debug-variable.maxDepth": {
+          "type": "number",
+          "default": 32,
+          "minimum": 1
+        },
+        "copy-cpp-debug-variable.maxVariables": {
+          "type": "number",
+          "default": 10000,
+          "minimum": 1
+        },
+        "copy-cpp-debug-variable.maxArrayItems": {
+          "type": "number",
+          "default": 1000,
+          "minimum": 1
+        },
+        "copy-cpp-debug-variable.variablePagingSize": {
+          "type": "number",
+          "default": 100,
+          "minimum": 1,
+          "maximum": 1000
+        }
       }
     }
   },
@@ -44,22 +61,41 @@
     "pretest": "pnpm run compile-tests && pnpm run compile && pnpm run lint",
     "check-types": "tsc --noEmit",
     "lint": "eslint src",
+    "test:unit": "pnpm run compile-tests && c8 mocha",
+    "test:coverage": "pnpm run compile-tests && c8 --check-coverage --lines 80 --functions 80 --branches 75 --statements 80 mocha",
     "test": "vscode-test"
   },
   "devDependencies": {
-    "@types/vscode": "^1.125.0",
     "@types/mocha": "^10.0.10",
     "@types/node": "24.x",
-    "typescript-eslint": "^8.61.1",
-    "eslint": "^10.5.0",
+    "@types/vscode": "^1.125.0",
+    "@vscode/test-cli": "^0.0.15",
+    "@vscode/test-electron": "^3.0.0",
+    "c8": "^9.1.0",
     "esbuild": "^0.28.1",
+    "eslint": "^10.5.0",
+    "mocha": "10.7.0",
     "npm-run-all": "^4.1.5",
     "typescript": "^6.0.3",
-    "@vscode/test-cli": "^0.0.15",
-    "@vscode/test-electron": "^3.0.0"
+    "typescript-eslint": "^8.61.1"
   },
   "overrides": {
     "diff": "^8.0.4",
     "serialize-javascript": "^7.0.6"
+  },
+  "c8": {
+    "all": true,
+    "include": [
+      "out/**/*.js"
+    ],
+    "exclude": [
+      "out/test/**",
+      "node_modules/**",
+      "dist/**"
+    ],
+    "reporter": [
+      "text",
+      "html"
+    ]
   }
 }
