@@ -47,6 +47,29 @@ export function isDapVariable(value: unknown): value is DapVariable {
     return typeof value === 'object' && value !== null && typeof (value as { name?: unknown }).name === 'string';
 }
 
+/**
+ * 识别 DAP 返回的 `type` 字段是否属于“字符串类”类型。
+ *
+ * cppdbg 等适配器会把 `std::string`、`const char *`、`char[16]` 等的内部 buffer/union 当作
+ * 子节点暴露给 `variables`，对它们展开会产生上百个无意义的字符子节点。把它们当成叶子即可，
+ * 因为适配器已经给出了可读的展示值（例如 `"hello"` 或 `0x55... "hello"`）。
+ *
+ * `std::vector<char>` 等真正是容器的类型不在此列，仍按容器展开。
+ */
+export function isStringLikeType(type: string | undefined): boolean {
+    if (!type) { return false; }
+    const t = type.replace(/\s+/g, ' ').trim();
+    // std::basic_string<char, ...> / std::basic_string_view<char, ...>
+    if (/^std::basic_string(_view)?\s*</.test(t)) { return true; }
+    // std::string / std::wstring / std::u16string / std::u32string / std::string_view（无模板实参别名）
+    if (/^std::(string|wstring|u16string|u32string|string_view)$/.test(t)) { return true; }
+    // char / const char 指针与定长数组（含可选 `signed` / `unsigned` 前缀）
+    if (/^((const|signed|unsigned)\s+)?char\s*(\*|\[\s*\d*\s*\])$/.test(t)) { return true; }
+    // wchar_t / char8_t / char16_t / char32_t 的指针与定长数组
+    if (/^((const|signed|unsigned)\s+)?(wchar_t|char8_t|char16_t|char32_t)\s*(\*|\[\s*\d*\s*\])$/.test(t)) { return true; }
+    return false;
+}
+
 export async function request<T>(session: vscode.DebugSession, command: string, args?: unknown): Promise<T> {
     return session.customRequest(command, args) as Promise<T>;
 }
@@ -62,6 +85,10 @@ export async function readVariableTree(variable: DapVariable, context: ReaderCon
 
     if (context.token?.isCancellationRequested) {
         throw new ReaderCancellationError();
+    }
+    // 字符串类类型：适配器已经给出可读值，避免把内部 buffer 当作字符数组展开
+    if (isStringLikeType(variable.type)) {
+        return node;
     }
     if (!variable.variablesReference) {
         return node;

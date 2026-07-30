@@ -1,6 +1,6 @@
 import * as assert from 'assert';
 import type * as vscode from 'vscode';
-import { DapVariable, ReaderCancellationError, ReaderLimits, isDapVariable, readVariableTree } from '../variableReader';
+import { DapVariable, ReaderCancellationError, ReaderLimits, isDapVariable, isStringLikeType, readVariableTree } from '../variableReader';
 import {
 	DebugCopyDeps,
 	VariableMenuContext,
@@ -24,7 +24,7 @@ function makeSessionWithType(type: string, impl: CustomRequest): vscode.DebugSes
 	return { type, customRequest: impl } as unknown as vscode.DebugSession;
 }
 
-const DEFAULT_LIMITS: ReaderLimits = { maxDepth: 32, maxVariables: 10000, maxArrayItems: 1000, pageSize: 100 };
+const DEFAULT_LIMITS: ReaderLimits = { maxDepth: 8, maxVariables: 10000, maxArrayItems: 1000, pageSize: 100 };
 
 function makeContext(session: vscode.DebugSession, overrides: Partial<ReaderLimits> = {}, token?: vscode.CancellationToken) {
 	return { session, limits: { ...DEFAULT_LIMITS, ...overrides }, token, count: 0, references: new Set<number>() };
@@ -65,6 +65,55 @@ suite('isDapVariable type guard', () => {
 	});
 });
 
+suite('isStringLikeType', () => {
+	const stringCases = [
+		'std::string',
+		'std::wstring',
+		'std::u16string',
+		'std::u32string',
+		'std::string_view',
+		'std::basic_string<char, std::char_traits<char>, std::allocator<char> >',
+		'std::basic_string_view<char, std::char_traits<char> >',
+		'const char *',
+		'char *',
+		'char[16]',
+		'const char[16]',
+		'wchar_t *',
+		'const wchar_t *',
+		'wchar_t[8]',
+		'char8_t *',
+		'char16_t *',
+		'char32_t *',
+		'unsigned char *',
+		// 兼容多余/不规则空白
+		'std::basic_string<char>',
+		'  std::string  ',
+	];
+	for (const t of stringCases) {
+		test(`matches ${t}`, () => {
+			assert.strictEqual(isStringLikeType(t), true);
+		});
+	}
+	const nonStringCases = [
+		undefined,
+		'',
+		'int',
+		'double',
+		'Person',
+		'std::vector<int>',
+		'std::vector<char>',
+		'std::array<char, 16>',
+		'std::map<std::string, int>',
+		'signed int',
+		'unsigned int',
+	];
+	for (const t of nonStringCases) {
+		test(`rejects ${t === undefined ? 'undefined' : JSON.stringify(t)}`, () => {
+			assert.strictEqual(isStringLikeType(t), false);
+		});
+	}
+});
+
 suite('readVariableTree', () => {
 	test('returns leaf when variablesReference is 0', async () => {
 		const session = makeSession(async () => { throw new Error('should not call'); });
@@ -80,7 +129,7 @@ suite('readVariableTree', () => {
 			if (cmd === 'variables' && (args as { variablesReference: number }).variablesReference === 1) {
 				return {
 					variables: [
-						{ name: 'name', value: '"Alice"', type: 'std::string', variablesReference: 2 },
+						{ name: 'name', value: '"Alice"', type: 'NameBuffer', variablesReference: 2 },
 						{ name: 'age', value: '29', type: 'int', variablesReference: 0 },
 					]
 				};
@@ -98,6 +147,47 @@ suite('readVariableTree', () => {
 		assert.strictEqual(data.children?.name.children?.size.value, '5');
 		assert.strictEqual(data.children?.age.value, '29');
 		assert.ok(calls.includes('variables'));
+	});
+
+	test('treats string-like types as leaves even when variablesReference is set', async () => {
+		const cases: Array<{ type: string; value: string }> = [
+			{ type: 'std::string', value: '"Alice"' },
+			{ type: 'std::basic_string<char, std::char_traits<char>, std::allocator<char> >', value: '"Alice"' },
+			{ type: 'std::wstring', value: 'L"Alice"' },
+			{ type: 'std::string_view', value: '"Alice"' },
+			{ type: 'std::basic_string_view<char, std::char_traits<char> >', value: '"Alice"' },
+			{ type: 'const char *', value: '0x555555 "Alice"' },
+			{ type: 'char *', value: '0x555555 "Alice"' },
+			{ type: 'char[16]', value: '"Alice"' },
+			{ type: 'const char[16]', value: '"Alice"' },
+			{ type: 'const wchar_t *', value: '0x555555 L"Alice"' },
+			{ type: 'wchar_t[8]', value: 'L"Alice"' },
+			{ type: 'char16_t *', value: 'u"hi"' },
+			{ type: 'unsigned char *', value: '0x555555 ""' },
+		];
+		for (const c of cases) {
+			let variablesCalls = 0;
+			const session = makeSession(async (cmd) => {
+				if (cmd === 'variables') { variablesCalls++; }
+				return { variables: [{ name: 'should', value: 'not', type: 'int', variablesReference: 0 }] };
+			});
+			const node = await readVariableTree({ name: 's', value: c.value, type: c.type, variablesReference: 42 }, makeContext(session));
+			assert.strictEqual(node.children, undefined, `${c.type} should not be expanded`);
+			assert.strictEqual(node.value, c.value);
+			assert.strictEqual(variablesCalls, 0, `${c.type} should not trigger a variables request`);
+		}
+	});
+
+	test('still expands non-string container types like std::vector<char>', async () => {
+		const session = makeSession(async (cmd, args) => {
+			if (cmd === 'variables') {
+				return { variables: [{ name: '0', value: '65 \'A\'', type: 'char', variablesReference: 0 }] };
+			}
+			return {};
+		});
+		const data = await readVariableTree({ name: 'buf', value: '{ size=1 }', type: 'std::vector<char>', variablesReference: 7, indexedItems: 1 }, makeContext(session, { maxArrayItems: 1 }));
+		assert.ok(data.children);
+		assert.strictEqual(data.children[0].value, '65 \'A\'');
 	});
 
 	test('marks truncated when max depth reached', async () => {

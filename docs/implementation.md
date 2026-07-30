@@ -73,6 +73,7 @@ readVariableTree(
 5. 调用 `variables` 读取子节点，优先使用 DAP 的 `start`/`count` 分段读取大数组。
 6. 每读取一个子节点递归处理，并累加全局变量计数。
 7. 发生单个子节点错误时保留已读数据，并在节点 `errors` 数组中记录错误，不应丢弃整个结果。
+8. 字符串类类型（`std::string` / `std::string_view` / `std::basic_string<...>` / `const char *` / `char[N]` / `wchar_t *` 等）一律视为叶子：适配器已经返回可读的展示值，把它们的内部 buffer/union 展开会变成上百个无意义的字符子节点。判定由 `variableReader.isStringLikeType()` 完成，按 `type` 字段做正则匹配。
 
 注意：DAP 的 `variablesReference` 是调试适配器生成的句柄，不等同于内存地址；它只能在同一调试会话生命周期内使用。
 

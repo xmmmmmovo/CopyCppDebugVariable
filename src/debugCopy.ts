@@ -1,7 +1,7 @@
 import type * as vscode from 'vscode';
 import { DapVariable, DapVariableNode, ReaderContext, ReaderLimits, isDapVariable, readVariableTree, request } from './variableReader';
 
-export const DEFAULT_LIMITS: ReaderLimits = { maxDepth: 32, maxVariables: 10000, maxArrayItems: 1000, pageSize: 100 };
+export const DEFAULT_LIMITS: ReaderLimits = { maxDepth: 8, maxVariables: 10000, maxArrayItems: 1000, pageSize: 100 };
 
 export const SCHEMA_VERSION = 1;
 

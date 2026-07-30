@@ -88,7 +88,7 @@ VS Code 公共 API 没有提供“直接取得 Debug Variables/Watch 树节点�
 
 ### 配置
 
-- `copy-cpp-debug-variable.maxDepth`：默认 32。
+- `copy-cpp-debug-variable.maxDepth`：默认 8。
 - `copy-cpp-debug-variable.maxVariables`：默认 10000。
 - `copy-cpp-debug-variable.maxArrayItems`：默认 1000。
 - `copy-cpp-debug-variable.variablePagingSize`：默认 100。
