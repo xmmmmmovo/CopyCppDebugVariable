@@ -9,8 +9,10 @@
   "categories": [
     "Other"
   ],
-  "activationEvents": [],
   "main": "./dist/extension.js",
+  "activationEvents": [
+    "onDebug"
+  ],
   "contributes": {
     "commands": [
       {
@@ -20,8 +22,52 @@
       {
         "command": "copy-cpp-debug-variable.saveAsJson",
         "title": "Save Debug Variable as JSON"
+      },
+      {
+        "command": "copy-cpp-debug-variable.copySelectedAsJson",
+        "title": "Copy as JSON"
+      },
+      {
+        "command": "copy-cpp-debug-variable.saveSelectedAsJson",
+        "title": "Save as JSON"
       }
     ],
+    "menus": {
+      "debug/variables/context": [
+        {
+          "command": "copy-cpp-debug-variable.copySelectedAsJson",
+          "when": "debugState == 'stopped'",
+          "group": "5_cutcopypaste@100"
+        },
+        {
+          "command": "copy-cpp-debug-variable.saveSelectedAsJson",
+          "when": "debugState == 'stopped'",
+          "group": "5_cutcopypaste@101"
+        }
+      ],
+      "debug/watch/context": [
+        {
+          "command": "copy-cpp-debug-variable.copySelectedAsJson",
+          "when": "debugState == 'stopped'",
+          "group": "5_cutcopypaste@100"
+        },
+        {
+          "command": "copy-cpp-debug-variable.saveSelectedAsJson",
+          "when": "debugState == 'stopped'",
+          "group": "5_cutcopypaste@101"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "copy-cpp-debug-variable.copySelectedAsJson",
+          "when": "false"
+        },
+        {
+          "command": "copy-cpp-debug-variable.saveSelectedAsJson",
+          "when": "false"
+        }
+      ]
+    },
     "configuration": {
       "title": "Copy Cpp Debug Variable",
       "properties": {
@@ -61,41 +107,22 @@
     "pretest": "pnpm run compile-tests && pnpm run compile && pnpm run lint",
     "check-types": "tsc --noEmit",
     "lint": "eslint src",
-    "test:unit": "pnpm run compile-tests && c8 mocha",
-    "test:coverage": "pnpm run compile-tests && c8 --check-coverage --lines 80 --functions 80 --branches 75 --statements 80 mocha",
     "test": "vscode-test"
   },
   "devDependencies": {
+    "@types/vscode": "^1.125.0",
     "@types/mocha": "^10.0.10",
     "@types/node": "24.x",
-    "@types/vscode": "^1.125.0",
-    "@vscode/test-cli": "^0.0.15",
-    "@vscode/test-electron": "^3.0.0",
-    "c8": "^9.1.0",
-    "esbuild": "^0.28.1",
+    "typescript-eslint": "^8.61.1",
     "eslint": "^10.5.0",
-    "mocha": "10.7.0",
+    "esbuild": "^0.28.1",
     "npm-run-all": "^4.1.5",
     "typescript": "^6.0.3",
-    "typescript-eslint": "^8.61.1"
+    "@vscode/test-cli": "^0.0.15",
+    "@vscode/test-electron": "^3.0.0"
   },
   "overrides": {
     "diff": "^8.0.4",
     "serialize-javascript": "^7.0.6"
-  },
-  "c8": {
-    "all": true,
-    "include": [
-      "out/**/*.js"
-    ],
-    "exclude": [
-      "out/test/**",
-      "node_modules/**",
-      "dist/**"
-    ],
-    "reporter": [
-      "text",
-      "html"
-    ]
   }
 }

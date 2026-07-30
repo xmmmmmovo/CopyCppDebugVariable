@@ -2,16 +2,28 @@
 
 ## 1. 模块划分
 
-建议将 `src` 拆分为以下模块，避免所有 DAP 逻辑堆积在 `extension.ts`：
+当前 `src` 的实际结构（保持薄 `extension.ts`，纯逻辑可单测）：
 
-- `extension.ts`：注册命令、串联用户流程、显示错误和进度。
-- `debugSession.ts`：封装 `DebugSession.customRequest`，统一请求和错误转换。
-- `dapTypes.ts`：定义 `EvaluateResponse`、`Variable`、`Scope`、`StackFrame` 等最小类型，以及运行时类型守卫。
-- `variableReader.ts`：从变量引用递归读取树，负责限制、循环检测、分页和取消。
-- `jsonSerializer.ts`：把 DAP 返回值转换为稳定的 JSON-safe 结构。
-- `output.ts`：剪贴板、JSON 文件保存、结果摘要。
+- `extension.ts`：唯一接触 `vscode` 命名空间的文件。构造 `DebugCopyDeps`、注册 4 个命令、维护 `sessionId -> DebugSession` 映射。
+- `debugCopy.ts`：命令编排。解析入口参数（右键菜单上下文 / 输入框）、组装结果文档、处理错误与取消。仅 `import type * as vscode`。
+- `variableReader.ts`：DAP 请求封装、类型守卫、递归读取树，负责限制、循环检测、分页和取消。
+- `src/test/extension.test.ts`：基于 mock `DebugSession` 与 mock `DebugCopyDeps` 的单元测试。
+
+依赖注入（`DebugCopyDeps`）是这里的关键：剪贴板、保存对话框、配置读取、时间戳、会话查找全部作为依赖传入，因此编排逻辑可以在没有 Extension Host 的情况下断言。
 
 ## 2. DAP 请求顺序
+
+### 右键菜单变量（无需 evaluate）
+
+```text
+menu argument { sessionId, container, variable }
+  -> getSessionById(sessionId) ?? activeDebugSession
+  -> variable.variablesReference
+  -> readVariables(variablesReference)
+  -> serialize
+```
+
+VS Code 已经在展开树时持有该变量的句柄，因此菜单参数里的 `variablesReference` 可直接使用。这条路径不调用 `evaluate`，所以对 `[0]`、匿名 union 成员、`operator[]` 结果这类没有合法表达式的节点同样有效。
 
 ### Watch 表达式
 
@@ -26,7 +38,7 @@ activeDebugSession
 
 `evaluate` 的结果通常包含 `result`、`type`、`variablesReference`、可选 `memoryReference`。当 `variablesReference === 0` 时，结果是叶子值，不再调用 `variables`。
 
-### Scope 变量
+### Scope 变量（未实现，保留设计）
 
 ```text
 threads -> choose stopped thread
@@ -95,16 +107,18 @@ readVariableTree(
 ```json
 {
   "schemaVersion": 1,
-  "source": "watch",
-  "expression": "person",
+  "source": "variables",
+  "expression": "alice.address.city",
   "sessionType": "cppdbg",
   "capturedAt": "2026-07-28T00:00:00.000Z",
-  "data": { "name": "person", "value": "...", "children": {} },
-  "warnings": []
+  "data": { "name": "city", "value": "...", "children": {} },
+  "warnings": [],
+  "truncated": false,
+  "nodeCount": 12
 }
 ```
 
-时间戳仅作为输出信息，不参与逻辑判断。
+`source` 区分入口：`variables` 表示来自 Variables/Watch 右键菜单，`watch` 表示来自命令面板输入的表达式。`expression` 在菜单路径下取 `evaluateName`，缺失时回退到变量名——它只是给人看的标识和默认文件名来源，不参与逻辑判断，时间戳同理。
 
 ## 5. 值转换策略
 
@@ -136,3 +150,68 @@ DAP 返回的 `value` 是字符串，不能可靠地直接解析成 JSON：例�
 - 不记录完整变量内容到日志，避免敏感数据泄露。
 - 错误消息可记录命令名和表达式摘要，但不记录可能包含密钥的值。
 - 剪贴板和文件保存属于用户明确触发的外部输出，应在命令结果中清楚提示。
+
+## 8. 右键菜单集成
+
+### 8.1 菜单贡献
+
+```jsonc
+"menus": {
+  "debug/variables/context": [
+    { "command": "copy-cpp-debug-variable.copySelectedAsJson", "when": "debugState == 'stopped'", "group": "5_cutcopypaste@100" },
+    { "command": "copy-cpp-debug-variable.saveSelectedAsJson", "when": "debugState == 'stopped'", "group": "5_cutcopypaste@101" }
+  ],
+  "debug/watch/context": [ /* 同上 */ ],
+  "commandPalette": [
+    { "command": "copy-cpp-debug-variable.copySelectedAsJson", "when": "false" },
+    { "command": "copy-cpp-debug-variable.saveSelectedAsJson", "when": "false" }
+  ]
+}
+```
+
+`5_cutcopypaste` 是内置 `Copy Value` / `Copy as Expression` 所在的分组；`@100` / `@101` 把新项排在该组末尾，视觉上与复制类操作聚在一起。`debug/watch/context` 未出现在官方贡献点文档中，但它确实注册在 VS Code 的可贡献菜单表里（`MenuId.DebugWatchContext`），与 `debug/variables/context` 同级。
+
+### 8.2 命令参数结构
+
+VS Code 调用菜单命令时传入的对象与内部 `IVariablesContext` 一致：
+
+```ts
+{
+  sessionId?: string,
+  container?: { name?, variablesReference? } | { expression: string }, // Watch 顶层项是 { expression }
+  variable: {
+    name: string,
+    value?: string,
+    type?: string,
+    evaluateName?: string,
+    variablesReference: number,   // 0 表示叶子
+    memoryReference?: string,
+  }
+}
+```
+
+约束与假设：
+
+1. 这是**未在公开 API 文档中承诺**的结构，因此必须运行时校验，不能直接强转。`isVariableMenuContext()` 只要求 `variable.name` 是字符串；不满足时命令退化为输入框流程，而不是抛错。
+2. `menuContextToVariable()` 只挑选已知的 DAP 字段，忽略 VS Code 可能新增的内部字段，避免它们进入 JSON 输出。
+3. `variablesReference` 是会话生命周期内的句柄，恢复运行后即失效，所以菜单项用 `when: debugState == 'stopped'` 限制。
+4. Watch 视图顶层表达式的 `evaluateName` 等于表达式本身；Variables 视图中的子节点则由适配器给出，数组元素、匿名成员可能没有 `evaluateName`，此时回退到 `name`。
+
+### 8.3 会话定位
+
+菜单只给 `sessionId` 字符串，而 DAP 请求需要 `vscode.DebugSession` 实例。`extension.ts` 用 `onDidStartDebugSession` / `onDidTerminateDebugSession` 维护映射表，并在激活时补入当前活动会话；查找顺序为：
+
+```text
+activeDebugSession.id === sessionId ? activeDebugSession : sessions.get(sessionId) ?? activeDebugSession
+```
+
+因为扩展默认惰性激活，若第一次激活发生在调试开始之后，映射表会缺少已有会话；`activationEvents: ["onDebug"]` 保证调试启动时扩展已经在监听。最后一层回退到活动会话，是为了在映射意外缺失时仍能工作——多会话场景下这可能读到错误的会话，但 `variablesReference` 属于另一会话时适配器会直接返回错误，并被记录成节点 `errors`，不会静默产出错误数据。
+
+### 8.4 与输入框路径的合并
+
+`copyVariableAsJson(deps, arg?)` 和 `saveVariableAsJson(deps, arg?)` 共用 `resolveTarget()`：
+
+- 参数通过 `isVariableMenuContext` → 直接构造 `ReadTarget { session, expression, source: 'variables', variable }`。
+- 否则 → 检查活动会话、弹输入框、`source: 'watch'`，`variable` 留空，由 `runRead()` 触发 `evaluate`。
+
+两条路径之后完全共享递归读取、限制、错误处理和输出逻辑，因此菜单入口没有引入第二套截断/循环检测规则。

@@ -8,6 +8,7 @@
 
 - 支持当前活动调试会话。
 - 支持从 Debug Variables 视图选择变量名，也支持输入/选择 Watch 表达式。
+- 在 Variables / Watch 视图右键菜单中直接提供 `Copy as JSON` / `Save as JSON`，无需手工输入表达式。
 - 递归读取结构体、类、数组、指针等具有 `variablesReference` 的子节点。
 - 将结果复制到系统剪贴板，并可选地保存为 JSON 文件。
 - 在无法读取、循环引用、深度/数量过大时给出可理解的提示，而不是阻塞扩展宿主。
@@ -39,28 +40,51 @@ VS Code 公共 API 没有提供“直接取得 Debug Variables/Watch 树节点�
 
 这种方式能够复用 cppdbg/clangd 相关调试适配器的实际能力，但不能假定每个适配器支持完全相同的参数或返回字段。请求失败必须被捕获并转换为用户提示及结果中的错误元数据。
 
+另外，虽然不存在“读取 Debug 视图节点”的 API，但 VS Code 会把被右键点击的变量作为**命令参数**传给 `debug/variables/context` 与 `debug/watch/context` 菜单命令。这条路径已经带有 `variablesReference`，因此菜单入口不需要 `evaluate`，也不依赖 Debug 视图 DOM。参数结构见 `docs/implementation.md` 第 8 节。
+
 ## 4. 推荐用户流程
+
+### 4.1 右键菜单（首选）
+
+1. 用户在断点处暂停。
+2. 在 Variables（Locals/Registers 等）或 Watch 视图中右键某个变量。
+3. 选择 `Copy as JSON` 或 `Save as JSON`。
+4. 扩展用菜单参数中的 `sessionId` 定位会话，用 `variablesReference` 递归展开该节点。
+5. 写入剪贴板或保存文件，并提示节点数量。
+
+该路径没有输入框，也不会二次求值，因此对同名变量、数组元素、匿名成员都是准确的。
+
+### 4.2 手工输入表达式
 
 1. 用户启动并暂停 C/C++ 调试。
 2. 执行命令 `Copy Debug Variable as JSON`。
 3. 扩展检查 `vscode.debug.activeDebugSession` 和暂停状态。
-4. 用户选择来源：
-   - `Evaluate expression`：输入变量名/Watch 表达式；
-   - `Select scope variable`：从当前 frame 的 Locals/Arguments 读取候选变量。
-5. 用户选择 frame（默认当前线程的 top frame），或使用默认 frame。
-6. 扩展读取顶层变量。
-7. 递归读取所有子变量，生成 JSON-safe 对象。
-8. 将格式化 JSON 写入剪贴板，并显示摘要；用户可选择保存文件。
+4. 用户输入变量名/Watch 表达式。
+5. 扩展调用 `evaluate` 取得顶层变量。
+6. 递归读取所有子变量，生成 JSON-safe 对象。
+7. 将格式化 JSON 写入剪贴板，并显示摘要；用户可选择保存文件。
 
-首版建议优先实现“输入 Watch 表达式”路径，因为它不需要模拟 Debug 视图的选中状态；随后再增加作用域变量选择。
+两条路径共用同一个读取器与输出文档结构，只在 `source` 字段上区分（`variables` 与 `watch`）。
 
-## 5. 命令与配置建议
+## 5. 命令与配置
 
 ### 命令
 
-- `copy-cpp-debug-variable.copyAsJson`：主命令。
-- `copy-cpp-debug-variable.copyFromWatch`：直接输入 Watch 表达式。
-- `copy-cpp-debug-variable.saveAsJson`：复制并保存。
+| 命令 ID | 标题 | 入口 |
+| --- | --- | --- |
+| `copy-cpp-debug-variable.copyAsJson` | Copy Debug Variable as JSON | 命令面板，输入表达式 |
+| `copy-cpp-debug-variable.saveAsJson` | Save Debug Variable as JSON | 命令面板，输入表达式 |
+| `copy-cpp-debug-variable.copySelectedAsJson` | Copy as JSON | Variables / Watch 右键菜单 |
+| `copy-cpp-debug-variable.saveSelectedAsJson` | Save as JSON | Variables / Watch 右键菜单 |
+
+菜单命令通过 `menus.commandPalette` 的 `when: false` 从命令面板隐藏：它们没有上下文参数时会退化成输入框流程，直接在面板里暴露两套入口只会让用户困惑。
+
+### 菜单
+
+- `debug/variables/context` 与 `debug/watch/context`，`group: 5_cutcopypaste@100/@101`，紧随内置的 `Copy Value` / `Copy as Expression`。
+- `when: debugState == 'stopped'`：变量句柄只在暂停期间有效。
+- 不限制 `debugType`。读取逻辑是通用 DAP，限制适配器类型会漏掉自定义 C/C++ 适配器，与 `docs/references.md` 的兼容性原则冲突。
+- `activationEvents: ["onDebug"]`：保证调试开始时扩展就已激活，从而完整维护 `sessionId -> DebugSession` 映射。
 
 ### 配置
 
@@ -91,11 +115,12 @@ VS Code 公共 API 没有提供“直接取得 Debug Variables/Watch 树节点�
 - 增加深度、数量、数组项限制。
 - 处理 `memoryReference`、指针、空引用和错误响应。
 
-### 阶段 C：作用域与 frame 选择
+### 阶段 C：右键菜单入口（已实现）
 
-- 请求 `threads`、`stackTrace`、`scopes`。
-- 让用户选择线程/frame/scope 变量。
-- 对选中的变量直接从 `variablesReference` 开始递归。
+- 贡献 `debug/variables/context` 与 `debug/watch/context` 菜单项。
+- 复用 VS Code 传入的变量上下文，跳过 `evaluate`，直接从 `variablesReference` 递归。
+- 按 `sessionId` 定位会话，支持多会话调试。
+- 保留命令面板的表达式输入路径作为回退。
 
 ### 阶段 D：保存、测试与体验
 
@@ -107,6 +132,8 @@ VS Code 公共 API 没有提供“直接取得 Debug Variables/Watch 树节点�
 ## 7. 验收标准
 
 - 在 cppdbg 暂停断点时，输入普通标量表达式可复制合法 JSON。
+- 在 Variables/Watch 视图右键任意变量都能看到 `Copy as JSON` / `Save as JSON`，且结果以被点击的节点为根。
+- 右键路径不发送 `evaluate` 请求；数组元素、匿名成员等没有合法表达式的节点同样可复制。
 - 结构体/类至少递归展开到配置的最大深度。
 - 数组不会因长度过大无限请求，超限时结果明确标注截断。
 - 同名兄弟变量不会互相覆盖（必要时使用数组或保留节点元数据）。

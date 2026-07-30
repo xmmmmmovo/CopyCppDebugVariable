@@ -59,7 +59,7 @@ int main() {
         .next = std::make_unique<LinkedNode>(LinkedNode{
             .value = 2,
             .label = "second",
-            .next = std::make_unique<LinkedNode>(LinkedNode{.value = 3, .label = "third"}),
+            .next = std::make_unique<LinkedNode>(LinkedNode{.value = 3, .label = "third",.next = nullptr}),
         }),
     });
 
