@@ -73,9 +73,53 @@ readVariableTree(
 5. 调用 `variables` 读取子节点，优先使用 DAP 的 `start`/`count` 分段读取大数组。
 6. 每读取一个子节点递归处理，并累加全局变量计数。
 7. 发生单个子节点错误时保留已读数据，并在节点 `errors` 数组中记录错误，不应丢弃整个结果。
-8. 字符串类类型（`std::string` / `std::string_view` / `std::basic_string<...>` / `const char *` / `char[N]` / `wchar_t *` 等）一律视为叶子：适配器已经返回可读的展示值，把它们的内部 buffer/union 展开会变成上百个无意义的字符子节点。判定由 `variableReader.isStringLikeType()` 完成，按 `type` 字段做正则匹配。
+8. 字符串类类型（`std::string` / `std::u8string` / `std::wstring` / `std::u16string` / `std::u32string` / `std::string_view` / `std::basic_string<...>` / `std::pmr::*` / `std::__cxx11::basic_string<...>` / `std::__1::basic_string<...>` / `const char *` / `char[N]` / `wchar_t *` 等）一律视为叶子。详见下文 3.1 节。判定由 `variableReader.isStringLikeType()` 完成，按 `type` 字段做正则匹配。
 
 注意：DAP 的 `variablesReference` 是调试适配器生成的句柄，不等同于内存地址；它只能在同一调试会话生命周期内使用。
+
+### 3.1 字符串内容重建
+
+对于步骤 8 命中的字符串类节点，`readVariableTree` 不再直接短路返回：
+如果该节点带有非零 `variablesReference`，会调用 `readStringValue`
+尝试从 char 子节点拼出完整字符串并写入 `value`，节点本身仍然作为叶子
+返回（无 `children`）。这条路径不会让适配器内部的 buffer / union /
+`[size]` / `[capacity]` / `[allocator]` 等字段泄漏到 JSON。
+
+`readStringValue` 的流程：
+
+1. `inferStringKindFromType(variable.type)` 推断子节点期望的编码
+   （`utf8` / `utf16` / `utf32`），无法判定时直接放弃重建。
+2. `indexedItems === 0` 视为空字符串返回 `''`，**不**发送 `variables` 请求。
+3. 分页调用 `variables`，参数与现有循环一致
+   （`start` / `count`、`pageSize` / `maxArrayItems` / `maxVariables`）。
+4. 只保留命名像索引（`[0]` / `0` / `(0)`）、且类型与第 1 步编码一致的
+   子节点；`[size]` / `[capacity]` / `[allocator]` / `[Raw View]` / `[More]`
+   等命名形式会被自然过滤掉。
+5. 按索引从 `0` 起依次解析每个子节点的 `value`，缺位或解析失败立刻返回
+   `undefined`，让 `readVariableTree` 保留适配器展示值。
+6. UTF-8 通过 `TextDecoder('utf-8')` 拼字节；UTF-16 / UTF-32 通过
+   `String.fromCharCode` 在 0x8000 字节的 chunk 上拼接（保留 surrogate pair）。
+   `wchar_t` 的位宽按宿主 `process.platform` 推断（`win32` → UTF-16，
+   其余 → UTF-32）。
+
+适配器差异：
+- cppdbg / cppvsdbg 都可能暴露 char 子节点（如
+  `[0]` … `[size-1]`，`type: char` / `char8_t` / `char16_t` / `wchar_t`）。
+- cppvsdbg 对部分 `std::string` 只返回截断的展示值而不暴露 char
+  子节点（例如 `very_long` 仅含 `[size]` / `[capacity]`），此时重建失败，
+  `value` 保留为适配器给出的截断文本，但**不会**暴露任何内部结构。
+- `memoryReference` 在 cppvsdbg 的 char 子节点上只是字节值的零扩展，
+  不是真实地址，不要用于重建。
+
+`parseCharUnits` 接受的 DAP char 值格式（按优先级）：
+1. `228 '\xe4'` —— 十进制 + 渲染字符（cppdbg、cppvsdbg 主流）
+2. `0x61 'a'` —— 十六进制 + 渲染字符
+3. `'\xE4\xB8\xAD'` —— 一个子节点里塞多个 UTF-8 字节的 hex 转义
+4. `'é'` —— 4 位 hex 转义
+5. `u'a'` / `L'a'` / `U'a'` —— 带 Unicode 前缀的字面量
+6. `'X'` —— 纯单字符字面量
+
+不可识别的输入返回 `undefined`，调用方走保留原值的回退路径。
 
 ## 4. JSON 输出结构
 
@@ -120,6 +164,8 @@ readVariableTree(
 ```
 
 `source` 区分入口：`variables` 表示来自 Variables/Watch 右键菜单，`watch` 表示来自命令面板输入的表达式。`expression` 在菜单路径下取 `evaluateName`，缺失时回退到变量名——它只是给人看的标识和默认文件名来源，不参与逻辑判断，时间戳同理。
+
+对字符串类节点，`data.value` 是从 char 子节点重建的完整 UTF-8 / UTF-16 文本（详见 §3.1）；若适配器不暴露 char 子节点，`value` 退化为其展示字符串（可能截断），但节点不会展开成内部结构。
 
 ## 5. 值转换策略
 

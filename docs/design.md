@@ -129,11 +129,18 @@ VS Code 公共 API 没有提供“直接取得 Debug Variables/Watch 树节点�
 - 编写 mock DebugSession 单元测试和 Extension Host 集成测试。
 - 更新 README、命令标题和故障排查说明。
 
+### 阶段 E：字符串内容重建
+
+- 扩展 `isStringLikeType` 覆盖 `std::u8string`、`std::pmr::*`、`std::__cxx11::basic_string<...>` / `std::__1::basic_string<...>` 等 ABI 形式。
+- 字符串类节点改为尝试从 char 子节点重建完整文本写入 `value`；当适配器不暴露 char 子节点时保留原展示值，避免内部 buffer / `[size]` / `[capacity]` / `[allocator]` 泄漏。
+- 详见 `docs/implementation.md` §3.1 和 `docs/testing.md` 第 17-20 条。
+
 ## 7. 验收标准
 
 - 在 cppdbg 暂停断点时，输入普通标量表达式可复制合法 JSON。
 - 在 Variables/Watch 视图右键任意变量都能看到 `Copy as JSON` / `Save as JSON`，且结果以被点击的节点为根。
 - 右键路径不发送 `evaluate` 请求；数组元素、匿名成员等没有合法表达式的节点同样可复制。
+- 字符串类节点（`std::string` / `std::u8string` / `std::pmr::*` / 自定义 allocator / ABI-tagged `basic_string<...>`）的 `value` 是从 char 子节点重建的完整 UTF-8 / UTF-16 文本；当适配器不暴露 char 子节点时保留适配器展示值，**不**暴露内部 buffer / `[size]` / `[capacity]` 等结构。
 - 结构体/类至少递归展开到配置的最大深度。
 - 数组不会因长度过大无限请求，超限时结果明确标注截断。
 - 同名兄弟变量不会互相覆盖（必要时使用数组或保留节点元数据）。

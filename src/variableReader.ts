@@ -74,6 +74,186 @@ export function isStringLikeType(type: string | undefined): boolean {
     return false;
 }
 
+/** 单个字符元素的编码类型：`utf8` / `utf16` / `utf32` / `unknown`。 */
+export type CharKind = 'utf8' | 'utf16' | 'utf32' | 'unknown';
+
+/**
+ * 识别 DAP 字符子节点的 `type` 字段属于哪种编码。
+ *
+ * `wchar_t` 在 Windows 上是 16 位（`winapi` / `L""`），在 Linux/macOS 上是 32 位，
+ * 这里直接用宿主 `process.platform` 决定，没有引入新的配置开关。
+ */
+export function getCharKind(type: string | undefined): CharKind {
+    if (!type) { return 'unknown'; }
+    const t = type.replace(/\s+/g, ' ').trim();
+    if (/^(const\s+)?(char8_t|unsigned\s+char|signed\s+char|char)$/.test(t)) { return 'utf8'; }
+    if (/^(const\s+)?char16_t$/.test(t)) { return 'utf16'; }
+    if (/^(const\s+)?char32_t$/.test(t)) { return 'utf32'; }
+    if (/^(const\s+)?wchar_t$/.test(t)) {
+        return process.platform === 'win32' ? 'utf16' : 'utf32';
+    }
+    return 'unknown';
+}
+
+/** 根据字符串父类型推断其子节点期望的字符编码。无法判定时返回 `unknown`。 */
+function inferStringKindFromType(type: string | undefined): CharKind {
+    if (!type) { return 'unknown'; }
+    const t = type.replace(/\s+/g, ' ').trim();
+    // std::* / std::pmr::* 别名（无模板实参）：后缀直接决定编码。
+    let m = /^std::(?:pmr::)?((?:u(?:8|16|32))?string|wstring|string_view)$/.exec(t);
+    if (m) {
+        const s = m[1];
+        if (s === 'string' || s === 'u8string') { return 'utf8'; }
+        if (s === 'u16string') { return 'utf16'; }
+        if (s === 'u32string') { return 'utf32'; }
+        if (s === 'wstring' || s === 'string_view') {
+            return process.platform === 'win32' ? 'utf16' : 'utf32';
+        }
+    }
+    // basic_string / basic_string_view（可带 ABI 命名空间）：看第一个模板参数。
+    m = /^std::((__cxx11|__1|__y|__z|__abi)::)?basic_string(_view)?\s*<\s*([^,>]+)/.exec(t);
+    if (m) { return getCharKind(m[4]); }
+    // 裸指针 / 数组：元素类型直接决定。
+    m = /^((const\s+)?(?:signed\s+|unsigned\s+)?)(char8_t|char16_t|char32_t|wchar_t|char)\s*(\*|\[\s*\d*\s*\])$/.exec(t);
+    if (m) { return getCharKind(m[3]); }
+    return 'unknown';
+}
+
+/**
+ * 把 DAP 适配器给的一个 char 子节点 `value` 字符串解析为数字码点。
+ *
+ * 真实会话里观察到的形式（按优先级）：
+ *   1) `228 '\xe4'`        — 十进制 + 渲染字符（cppdbg、cppvsdbg）
+ *   2) `0x61 'a'`          — 十六进制 + 渲染字符
+ *   3) `'\xE4\xB8\xAD'`    — 一个子节点里塞多个 UTF-8 字节的 hex 转义
+ *   4) `u'a'` / `L'a'` / `U'a'` — 带前缀的 Unicode 字面量
+ *   5) `'X'`               — 纯单字符字面量
+ *
+ * 不可识别的输入返回 `undefined`，调用方应保留适配器展示值。
+ */
+export function parseCharUnits(value: string | undefined): readonly number[] | undefined {
+    if (!value) { return undefined; }
+    const v = value.trim();
+    if (!v) { return undefined; }
+
+    // 1) <decimal> '<glyph>'
+    let m = /^(\d+)\s*'(?:\\.|[^'\\])*'$/.exec(v);
+    if (m) { return [parseInt(m[1], 10)]; }
+
+    // 2) 0x<hex> '<glyph>'
+    m = /^0x([0-9a-fA-F]+)\s*'(?:\\.|[^'\\])*'$/.exec(v);
+    if (m) { return [parseInt(m[1], 16)]; }
+
+    // 3) '\x..\x..\x..' / '\uNNNN'  — 多个 UTF-8 字节或单个码点打包在一个子节点里
+    m = /^'((?:\\x[0-9a-fA-F]{2})+|\\u[0-9a-fA-F]{4})'$/.exec(v);
+    if (m) {
+        const xMatches = m[1].match(/\\x([0-9a-fA-F]{2})/g);
+        if (xMatches) { return xMatches.map(h => parseInt(h.slice(2), 16)); }
+        const uMatch = m[1].match(/\\u([0-9a-fA-F]{4})/);
+        if (uMatch) { return [parseInt(uMatch[1], 16)]; }
+    }
+
+    // 4) [uLU]'X' / [uLU]'\xNN' / [uLU]'\uNNNN'
+    m = /^[uLU]'(?:\\x([0-9a-fA-F]{1,2})|\\u([0-9a-fA-F]{1,4})|([^'\\]))'$/.exec(v);
+    if (m) {
+        if (m[1]) { return [parseInt(m[1], 16)]; }
+        if (m[2]) { return [parseInt(m[2], 16)]; }
+        if (m[3]) { return [m[3].charCodeAt(0)]; }
+    }
+
+    // 5) 'X'  — 单字符字面量
+    m = /^'([^'\\])'$/.exec(v);
+    if (m) { return [m[1].charCodeAt(0)]; }
+
+    return undefined;
+}
+
+/**
+ * 如果 `variable` 是字符串类容器，则读取其 char 子节点并重建完整字符串。
+ *
+ * - 返回 `''`：空容器（`indexedItems === 0`），不发送 `variables` 请求。
+ * - 返回完整文本：能从 char 子节点拼出至少一个字符。
+ * - 返回 `undefined`：没有可识别的 char 子节点 / 任一子节点解析失败 /
+ *   `variables` 请求失败。调用方应保留适配器展示值。
+ *
+ * `ReaderCancellationError` 始终向上抛。
+ */
+export async function readStringValue(variable: DapVariable, context: ReaderContext): Promise<string | undefined> {
+    const kind = inferStringKindFromType(variable.type);
+    if (kind === 'unknown') { return undefined; }
+    if (!variable.variablesReference) { return undefined; }
+
+    // 空容器：直接是 ""，连请求都不发。
+    if (variable.indexedItems === 0) { return ''; }
+    if (context.token?.isCancellationRequested) { throw new ReaderCancellationError(); }
+
+    // 用与 readVariableTree 相同的分页参数收集子节点，避免破坏 maxVariables 限制。
+    const total = Math.min(variable.indexedItems ?? context.limits.maxArrayItems, context.limits.maxArrayItems);
+    const collected = new Map<number, DapVariable>();
+    let truncated = false;
+
+    for (let start = 0; start < total; start += context.limits.pageSize) {
+        if (context.token?.isCancellationRequested) { throw new ReaderCancellationError(); }
+        if (context.count >= context.limits.maxVariables) { truncated = true; break; }
+        const count = Math.min(context.limits.pageSize, total - start);
+        const response = await request<{ variables?: DapVariable[] }>(context.session, 'variables', {
+            variablesReference: variable.variablesReference,
+            start,
+            count,
+        });
+        const vars = (response.variables ?? []).filter(isDapVariable);
+        if (vars.length === 0) { break; }
+        for (const child of vars) {
+            if (context.count >= context.limits.maxVariables) { truncated = true; break; }
+            context.count++;
+            // 只保留命名像索引、且字符类型匹配预期的子节点。
+            const idx = /^[\[(]?(\d+)[\])]?$/.exec(child.name);
+            if (!idx) { continue; }
+            if (getCharKind(child.type) !== kind) { continue; }
+            const n = parseInt(idx[1], 10);
+            // 同一索引出现多次（如命名 + 索引）时，保留第一个，避免误覆盖。
+            if (!collected.has(n)) { collected.set(n, child); }
+        }
+        if (vars.length < count || truncated) { break; }
+    }
+
+    if (collected.size === 0) { return undefined; }
+    if (truncated) { return undefined; }
+
+    // 按索引从 0 开始依次解析；任何缺失或解析失败都放弃重建。
+    const size = variable.indexedItems ?? collected.size;
+    const builder: number[] = [];
+    for (let i = 0; i < size; i++) {
+        const child = collected.get(i);
+        if (!child) { return undefined; }
+        const units = parseCharUnits(child.value);
+        if (!units) { return undefined; }
+        for (const u of units) {
+            if (kind === 'utf8' && u > 0xff) { return undefined; }
+            builder.push(u);
+        }
+    }
+
+    return encodeCharUnits(builder, kind);
+}
+
+function encodeCharUnits(units: readonly number[], kind: CharKind): string {
+    if (kind === 'utf8') {
+        const bytes = new Uint8Array(units.length);
+        for (let i = 0; i < units.length; i++) { bytes[i] = units[i]; }
+        return new TextDecoder('utf-8').decode(bytes);
+    }
+    // utf16 / utf32 都用 String.fromCharCode：码点 > 0xFFFF 时它会自动产生
+    // surrogate pair，所以两种宽度可以共用一份编码逻辑。0x8000 是经验阈值，
+    // 避免 .apply 参数过多触发栈溢出。
+    let out = '';
+    for (let i = 0; i < units.length; i += 0x8000) {
+        const chunk = Array.from(units.slice(i, i + 0x8000));
+        out += String.fromCharCode.apply(null, chunk as number[]);
+    }
+    return out;
+}
+
 export async function request<T>(session: vscode.DebugSession, command: string, args?: unknown): Promise<T> {
     return session.customRequest(command, args) as Promise<T>;
 }
@@ -90,8 +270,19 @@ export async function readVariableTree(variable: DapVariable, context: ReaderCon
     if (context.token?.isCancellationRequested) {
         throw new ReaderCancellationError();
     }
-    // 字符串类类型：适配器已经给出可读值，避免把内部 buffer 当作字符数组展开
+    // 字符串类类型：尝试从 char 子节点重建完整文本写回 value。
+    // 适配器不暴露 char 子节点（cppvsdbg 的 std::string）或解码失败时，
+    // 保留原展示值，不把内部 buffer 暴露给 JSON。
     if (isStringLikeType(variable.type)) {
+        if (variable.variablesReference) {
+            try {
+                const reconstructed = await readStringValue(variable, context);
+                if (reconstructed !== undefined) { node.value = reconstructed; }
+            } catch (error) {
+                if (error instanceof ReaderCancellationError) { throw error; }
+                // 其他错误一律忽略，保留适配器展示值。
+            }
+        }
         return node;
     }
     if (!variable.variablesReference) {

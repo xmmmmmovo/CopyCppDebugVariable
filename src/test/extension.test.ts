@@ -1,6 +1,6 @@
 import * as assert from 'assert';
 import type * as vscode from 'vscode';
-import { DapVariable, ReaderCancellationError, ReaderLimits, isDapVariable, isStringLikeType, readVariableTree } from '../variableReader';
+import { DapVariable, ReaderCancellationError, ReaderLimits, isDapVariable, isStringLikeType, parseCharUnits, readStringValue, readVariableTree } from '../variableReader';
 import {
 	DebugCopyDeps,
 	VariableMenuContext,
@@ -188,15 +188,53 @@ suite('readVariableTree', () => {
 			{ type: 'unsigned char *', value: '0x555555 ""' },
 		];
 		for (const c of cases) {
+			// 模拟适配器返回的是非 char 的“噪声”子节点（如 cppvsdbg 的 [size]/[capacity]
+			// 或根本无子节点），此时不应重建字符串，也不应让内部字段泄漏。
 			let variablesCalls = 0;
 			const session = makeSession(async (cmd) => {
 				if (cmd === 'variables') { variablesCalls++; }
-				return { variables: [{ name: 'should', value: 'not', type: 'int', variablesReference: 0 }] };
+				return { variables: [{ name: '[size]', value: '0', type: 'unsigned __int64', variablesReference: 0 }] };
 			});
 			const node = await readVariableTree({ name: 's', value: c.value, type: c.type, variablesReference: 42 }, makeContext(session));
-			assert.strictEqual(node.children, undefined, `${c.type} should not be expanded`);
-			assert.strictEqual(node.value, c.value);
-			assert.strictEqual(variablesCalls, 0, `${c.type} should not trigger a variables request`);
+			assert.strictEqual(node.children, undefined, `${c.type} should not expose children`);
+			assert.strictEqual(node.value, c.value, `${c.type} should keep adapter value when no char children`);
+			assert.ok(variablesCalls >= 1, `${c.type} should consult variables to look for char children`);
+		}
+	});
+
+	test('reconstructs string value from indexed char children', async () => {
+		const cases: Array<{ type: string; indexedItems: number; children: DapVariable[]; expected: string; charKind: 'utf8' | 'utf16' | 'utf32' }> = [
+			{
+				type: 'std::string',
+				indexedItems: 5,
+				charKind: 'utf8',
+				children: [
+					{ name: '[0]', value: "72 'H'", type: 'char', variablesReference: 0 },
+					{ name: '[1]', value: "101 'e'", type: 'char', variablesReference: 0 },
+					{ name: '[2]', value: "108 'l'", type: 'char', variablesReference: 0 },
+					{ name: '[3]', value: "108 'l'", type: 'char', variablesReference: 0 },
+					{ name: '[4]', value: "111 'o'", type: 'char', variablesReference: 0 },
+				],
+				expected: 'Hello',
+			},
+			{
+				type: 'std::u8string',
+				indexedItems: 1,
+				charKind: 'utf8',
+				children: [
+					{ name: '[0]', value: "'\\xE4\\xBD\\xA0'", type: 'char8_t', variablesReference: 0 },
+				],
+				expected: '你',
+			},
+		];
+		for (const c of cases) {
+			const session = makeSession(async (cmd) => cmd === 'variables' ? { variables: c.children } : {});
+			const node = await readVariableTree(
+				{ name: 's', value: '"..."', type: c.type, variablesReference: 42, indexedItems: c.indexedItems },
+				makeContext(session),
+			);
+			assert.strictEqual(node.value, c.expected, `${c.type} should reconstruct to ${JSON.stringify(c.expected)}`);
+			assert.strictEqual(node.children, undefined, `${c.type} should not expose char children`);
 		}
 	});
 
@@ -210,6 +248,38 @@ suite('readVariableTree', () => {
 		const data = await readVariableTree({ name: 'buf', value: '{ size=1 }', type: 'std::vector<char>', variablesReference: 7, indexedItems: 1 }, makeContext(session, { maxArrayItems: 1 }));
 		assert.ok(data.children);
 		assert.strictEqual(data.children[0].value, '65 \'A\'');
+	});
+
+	test('treats empty std::string as empty value without consulting variables', async () => {
+		let variablesCalls = 0;
+		const session = makeSession(async (cmd) => {
+			if (cmd === 'variables') { variablesCalls++; }
+			return { variables: [] };
+		});
+		const node = await readVariableTree(
+			{ name: 'empty', value: '""', type: 'std::string', variablesReference: 99, indexedItems: 0 },
+			makeContext(session),
+		);
+		assert.strictEqual(node.value, '');
+		assert.strictEqual(node.children, undefined);
+		assert.strictEqual(variablesCalls, 0, 'empty string must not trigger a variables request');
+	});
+
+	test('keeps adapter value when std::string exposes no char children (cppvsdbg fallback)', async () => {
+		const session = makeSession(async (cmd) => cmd === 'variables' ? {
+			variables: [
+				{ name: '[size]', value: '300', type: 'unsigned __int64', variablesReference: 0 },
+				{ name: '[capacity]', value: '300', type: 'unsigned __int64', variablesReference: 0 },
+				{ name: '[allocator]', value: 'allocator', type: 'std::allocator<char>', variablesReference: 0 },
+			],
+		} : {});
+		const node = await readVariableTree(
+			{ name: 'long_str', value: '"Lorem ipsum...aliqua...', type: 'std::string', variablesReference: 7, indexedItems: 300 },
+			makeContext(session),
+		);
+		// 保留截断的展示值，不暴露内部 [size]/[capacity]/[allocator] 等结构。
+		assert.strictEqual(node.value, '"Lorem ipsum...aliqua...');
+		assert.strictEqual(node.children, undefined);
 	});
 
 	test('marks truncated when max depth reached', async () => {
@@ -332,6 +402,164 @@ suite('readVariableTree', () => {
 		const variable: DapVariable = { name: 'root', variablesReference: 1, indexedItems: 50 };
 		const data = await readVariableTree(variable, makeContext(session));
 		assert.strictEqual(data.children, undefined);
+	});
+});
+
+suite('parseCharUnits', () => {
+	const cases: Array<{ input: string | undefined; expected: readonly number[] | undefined }> = [
+		// 1) <decimal> '<glyph>' —— cppdbg、cppvsdbg 主流
+		{ input: "72 'H'", expected: [72] },
+		{ input: "228 '\\xe4'", expected: [228] },
+		// 2) 0x<hex> '<glyph>'
+		{ input: "0x61 'a'", expected: [0x61] },
+		// 3) 一个子节点里塞多个 UTF-8 字节（cppvsdbg 对 char8_t 的截断渲染）
+		{ input: "'\\xE4'", expected: [0xE4] },
+		{ input: "'\\xE4\\xB8\\xAD'", expected: [0xE4, 0xB8, 0xAD] },
+		// 4) [uLU]'X' / [uLU]'\xNN' / [uLU]'\uNNNN'
+		{ input: "u'a'", expected: [97] },
+		{ input: "L'a'", expected: [97] },
+		{ input: "U'a'", expected: [97] },
+		{ input: "'\\u00E9'", expected: [0xE9] },
+		// 5) 'X' 纯字面量
+		{ input: "'a'", expected: [97] },
+		// 不可识别
+		{ input: 'a', expected: undefined },
+		{ input: undefined, expected: undefined },
+		{ input: '', expected: undefined },
+		{ input: 'garbage', expected: undefined },
+		{ input: "'", expected: undefined },
+	];
+	for (const c of cases) {
+		test(`parses ${JSON.stringify(c.input)}`, () => {
+			assert.deepStrictEqual(parseCharUnits(c.input), c.expected);
+		});
+	}
+});
+
+suite('readStringValue', () => {
+	test('reconstructs printable ASCII from cppdbg-style char children', async () => {
+		let variablesCalls = 0;
+		const session = makeSession(async (cmd) => {
+			if (cmd === 'variables') {
+				variablesCalls++;
+				return { variables: [
+					{ name: '[0]', value: "72 'H'", type: 'char', variablesReference: 0 },
+					{ name: '[1]', value: "101 'e'", type: 'char', variablesReference: 0 },
+					{ name: '[2]', value: "108 'l'", type: 'char', variablesReference: 0 },
+					{ name: '[3]', value: "108 'l'", type: 'char', variablesReference: 0 },
+					{ name: '[4]', value: "111 'o'", type: 'char', variablesReference: 0 },
+				] };
+			}
+			return {};
+		});
+		const result = await readStringValue(
+			{ name: 's', value: '"..."', type: 'std::string', variablesReference: 42, indexedItems: 5 },
+			makeContext(session),
+		);
+		assert.strictEqual(result, 'Hello');
+		assert.strictEqual(variablesCalls, 1);
+	});
+
+	test('decodes packed UTF-8 multi-byte child for std::u8string', async () => {
+		const session = makeSession(async (cmd) => cmd === 'variables' ? {
+			variables: [{ name: '[0]', value: "'\\xE4\\xBD\\xA0'", type: 'char8_t', variablesReference: 0 }],
+		} : {});
+		const result = await readStringValue(
+			{ name: 'utf8', value: '"..."', type: 'std::u8string', variablesReference: 7, indexedItems: 1 },
+			makeContext(session),
+		);
+		assert.strictEqual(result, '你');
+	});
+
+	test('combines surrogate pair halves from std::u16string children', async () => {
+		const session = makeSession(async (cmd) => cmd === 'variables' ? {
+			variables: [
+				{ name: '[0]', value: "0xD834 '?'", type: 'char16_t', variablesReference: 0 },
+				{ name: '[1]', value: "0xDD1E '?'", type: 'char16_t', variablesReference: 0 },
+			],
+		} : {});
+		const result = await readStringValue(
+			{ name: 'u16', value: '"..."', type: 'std::u16string', variablesReference: 9, indexedItems: 2 },
+			makeContext(session),
+		);
+		assert.strictEqual(result, '𝄞'); // U+1D11E 𝄞
+	});
+
+	test('returns empty string for indexedItems: 0 without a variables request', async () => {
+		let variablesCalls = 0;
+		const session = makeSession(async (cmd) => {
+			if (cmd === 'variables') { variablesCalls++; }
+			return { variables: [] };
+		});
+		const result = await readStringValue(
+			{ name: 'empty', value: '""', type: 'std::string', variablesReference: 99, indexedItems: 0 },
+			makeContext(session),
+		);
+		assert.strictEqual(result, '');
+		assert.strictEqual(variablesCalls, 0);
+	});
+
+	test('returns undefined when only non-char siblings are exposed (cppvsdbg fallback)', async () => {
+		const session = makeSession(async (cmd) => cmd === 'variables' ? {
+			variables: [
+				{ name: '[size]', value: '300', type: 'unsigned __int64', variablesReference: 0 },
+				{ name: '[capacity]', value: '300', type: 'unsigned __int64', variablesReference: 0 },
+				{ name: '[allocator]', value: 'allocator', type: 'std::allocator<char>', variablesReference: 0 },
+			],
+		} : {});
+		const result = await readStringValue(
+			{ name: 'long_str', value: '"Lorem...aliqua...', type: 'std::string', variablesReference: 7, indexedItems: 300 },
+			makeContext(session),
+		);
+		assert.strictEqual(result, undefined);
+	});
+
+	test('returns undefined when any char child value fails to parse', async () => {
+		const session = makeSession(async (cmd) => cmd === 'variables' ? {
+			variables: [
+				{ name: '[0]', value: "72 'H'", type: 'char', variablesReference: 0 },
+				{ name: '[1]', value: '???', type: 'char', variablesReference: 0 },
+			],
+		} : {});
+		const result = await readStringValue(
+			{ name: 's', value: '"..."', type: 'std::string', variablesReference: 7, indexedItems: 2 },
+			makeContext(session),
+		);
+		assert.strictEqual(result, undefined);
+	});
+
+	test('pages large strings using start/count', async () => {
+		const requested: Array<{ start: number; count: number }> = [];
+		const session = makeSession(async (cmd, args) => {
+			if (cmd === 'variables') {
+				const a = args as { start: number; count: number };
+				requested.push({ start: a.start, count: a.count });
+				const items = Array.from({ length: a.count }, (_, i) => ({
+					name: `[${a.start + i}]`,
+					value: `${(97 + ((a.start + i) % 26))} 'x'`,
+					type: 'char',
+					variablesReference: 0,
+				}));
+				return { variables: items };
+			}
+			return {};
+		});
+		const result = await readStringValue(
+			{ name: 's', value: '"..."', type: 'std::string', variablesReference: 7, indexedItems: 250 },
+			makeContext(session, { pageSize: 100, maxArrayItems: 250 }),
+		);
+		assert.deepStrictEqual(requested.map(r => [r.start, r.count]), [[0, 100], [100, 100], [200, 50]]);
+		assert.ok(result);
+		assert.strictEqual(result.length, 250);
+	});
+
+	test('throws ReaderCancellationError when token is cancelled', async () => {
+		const session = makeSession(async () => ({ variables: [] }));
+		const token: vscode.CancellationToken = { isCancellationRequested: true, onCancellationRequested: () => ({ dispose() { /* noop */ } }) } as unknown as vscode.CancellationToken;
+		await assert.rejects(
+			readStringValue({ name: 's', type: 'std::string', variablesReference: 1 }, makeContext(session, {}, token)),
+			(err: unknown) => err instanceof ReaderCancellationError,
+		);
 	});
 });
 
