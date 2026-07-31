@@ -7,7 +7,7 @@
 - `extension.ts`：唯一接触 `vscode` 命名空间的文件。构造 `DebugCopyDeps`、注册 4 个命令、维护 `sessionId -> DebugSession` 映射。
 - `debugCopy.ts`：命令编排。解析入口参数（右键菜单上下文 / 输入框）、组装结果文档、处理错误与取消。仅 `import type * as vscode`。
 - `variableReader.ts`：DAP 请求封装、类型守卫、递归读取树，负责限制、循环检测、分页和取消。
-- `src/test/extension.test.ts`：基于 mock `DebugSession` 与 mock `DebugCopyDeps` 的单元测试。
+- `src/test/extension.test.ts`、`src/test/variableReader.test.ts`、`src/test/contextMenu.test.ts`、`src/test/debugCopy.test.ts`：按模块拆分的单元测试，使用 `src/test/helpers.ts` 共享的 mock `DebugSession` 与 mock `DebugCopyDeps`。
 
 依赖注入（`DebugCopyDeps`）是这里的关键：剪贴板、保存对话框、配置读取、时间戳、会话查找全部作为依赖传入，因此编排逻辑可以在没有 Extension Host 的情况下断言。
 
@@ -79,11 +79,20 @@ readVariableTree(
 
 ### 3.1 字符串内容重建
 
-对于步骤 8 命中的字符串类节点，`readVariableTree` 不再直接短路返回：
-如果该节点带有非零 `variablesReference`，会调用 `readStringValue`
-尝试从 char 子节点拼出完整字符串并写入 `value`，节点本身仍然作为叶子
-返回（无 `children`）。这条路径不会让适配器内部的 buffer / union /
-`[size]` / `[capacity]` / `[allocator]` 等字段泄漏到 JSON。
+对于步骤 8 命中的字符串类节点，`readVariableTree` 把它视为叶子
+返回（无 `children`）。`value` 的优先级是：
+
+1. 如果该节点有非零 `variablesReference`，调用 `readStringValue`
+   尝试从 char / byte 子节点拼出完整字符串并写入 `value`。
+2. 重建失败（无 char 子节点 / 解析失败 / 超 `maxArrayItems` 截断）或
+   整个节点没有 `variablesReference`：**主动丢弃 adapter 展示值**。
+   cppvsdbg 对 `std::byte[N]` 的字节 dump 预览（如
+   `0x... {168 '�', 232 '�', ...}`）、对 `std::string` 的截断 preview
+   （如 `"Lorem ipsum...aliqua..."`）都不应保留——它们不是 string 本身，
+   套在叶子节点上只会误导读者。
+
+这条路径不会让适配器内部的 buffer / union / `[size]` / `[capacity]` /
+`[allocator]` 等字段泄漏到 JSON。
 
 `readStringValue` 的流程：
 
@@ -96,7 +105,7 @@ readVariableTree(
    子节点；`[size]` / `[capacity]` / `[allocator]` / `[Raw View]` / `[More]`
    等命名形式会被自然过滤掉。
 5. 按索引从 `0` 起依次解析每个子节点的 `value`，缺位或解析失败立刻返回
-   `undefined`，让 `readVariableTree` 保留适配器展示值。
+   `undefined`，让 `readVariableTree` 丢弃 adapter 展示值。
 6. UTF-8 通过 `TextDecoder('utf-8')` 拼字节；UTF-16 / UTF-32 通过
    `String.fromCharCode` 在 0x8000 字节的 chunk 上拼接（保留 surrogate pair）。
    `wchar_t` 的位宽按宿主 `process.platform` 推断（`win32` → UTF-16，
@@ -107,7 +116,9 @@ readVariableTree(
   `[0]` … `[size-1]`，`type: char` / `char8_t` / `char16_t` / `wchar_t`）。
 - cppvsdbg 对部分 `std::string` 只返回截断的展示值而不暴露 char
   子节点（例如 `very_long` 仅含 `[size]` / `[capacity]`），此时重建失败，
-  `value` 保留为适配器给出的截断文本，但**不会**暴露任何内部结构。
+  `value` 主动丢弃（不再保留截断 preview），但**不会**暴露任何内部结构。
+- cppvsdbg 对 `std::byte[N]`（典型如 PMR 背书缓冲）通常以 `<hex> {NN '?', ...}`
+  形式预览，且不会暴露 byte 子节点；同样丢弃 value，不展开为 2048 个子节点。
 - `memoryReference` 在 cppvsdbg 的 char 子节点上只是字节值的零扩展，
   不是真实地址，不要用于重建。
 
@@ -165,7 +176,7 @@ readVariableTree(
 
 `source` 区分入口：`variables` 表示来自 Variables/Watch 右键菜单，`watch` 表示来自命令面板输入的表达式。`expression` 在菜单路径下取 `evaluateName`，缺失时回退到变量名——它只是给人看的标识和默认文件名来源，不参与逻辑判断，时间戳同理。
 
-对字符串类节点，`data.value` 是从 char 子节点重建的完整 UTF-8 / UTF-16 文本（详见 §3.1）；若适配器不暴露 char 子节点，`value` 退化为其展示字符串（可能截断），但节点不会展开成内部结构。
+对字符串类节点，`data.value` 是从 char / byte 子节点重建的完整 UTF-8 / UTF-16 文本（详见 §3.1）；无法重建时 `value` 直接丢弃（仅保留 `type` / `memoryReference`），节点不会展开成内部结构。
 
 ## 5. 值转换策略
 

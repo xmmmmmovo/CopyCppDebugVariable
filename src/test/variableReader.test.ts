@@ -151,7 +151,9 @@ suite('readVariableTree', () => {
 		];
 		for (const c of cases) {
 			// 模拟适配器返回的是非 char 的“噪声”子节点（如 cppvsdbg 的 [size]/[capacity]
-			// 或根本无子节点），此时不应重建字符串，也不应让内部字段泄漏。
+			// 或根本无子节点），此时不应重建字符串，也不应让内部字段泄漏；
+			// adapter 的截断 preview（或 std::byte[N] 的字节 dump）也不应作为
+			// 叶子 value 保留——string-like 节点只有 value, value 必须是 string 本身。
 			let variablesCalls = 0;
 			const session = makeSession(async (cmd) => {
 				if (cmd === 'variables') { variablesCalls++; }
@@ -159,7 +161,7 @@ suite('readVariableTree', () => {
 			});
 			const node = await readVariableTree({ name: 's', value: c.value, type: c.type, variablesReference: 42 }, makeContext(session));
 			assert.strictEqual(node.children, undefined, `${c.type} should not expose children`);
-			assert.strictEqual(node.value, c.value, `${c.type} should keep adapter value when no char children`);
+			assert.strictEqual(node.value, undefined, `${c.type} should drop adapter value when no char children`);
 			assert.ok(variablesCalls >= 1, `${c.type} should consult variables to look for char children`);
 		}
 	});
@@ -219,13 +221,15 @@ suite('readVariableTree', () => {
 		assert.strictEqual(node.children, undefined);
 	});
 
-	test('keeps adapter value when std::byte[N] exposes no char children', async () => {
+	test('drops adapter value when std::byte[N] exposes no char children', async () => {
 		const session = makeSession(async (cmd) => cmd === 'variables' ? { variables: [] } : {});
 		const node = await readVariableTree(
 			{ name: 'pmr_buf', value: '0x555555 ' + '{0, 0, 0, ...}', type: 'std::byte[2048]', variablesReference: 7, indexedItems: 4 },
 			makeContext(session),
 		);
-		assert.strictEqual(node.value, '0x555555 ' + '{0, 0, 0, ...}');
+		// string-like 节点只有 value, value 必须是 string 本身；
+		// 重建不出 UTF-8 时把 cppvsdbg 的字节 dump summary 丢掉。
+		assert.strictEqual(node.value, undefined);
 		assert.strictEqual(node.children, undefined);
 	});
 
@@ -256,7 +260,7 @@ suite('readVariableTree', () => {
 		assert.strictEqual(variablesCalls, 0, 'empty string must not trigger a variables request');
 	});
 
-	test('keeps adapter value when std::string exposes no char children (cppvsdbg fallback)', async () => {
+	test('drops adapter value when std::string exposes no char children', async () => {
 		const session = makeSession(async (cmd) => cmd === 'variables' ? {
 			variables: [
 				{ name: '[size]', value: '300', type: 'unsigned __int64', variablesReference: 0 },
@@ -268,8 +272,10 @@ suite('readVariableTree', () => {
 			{ name: 'long_str', value: '"Lorem ipsum...aliqua...', type: 'std::string', variablesReference: 7, indexedItems: 300 },
 			makeContext(session),
 		);
-		// 保留截断的展示值，不暴露内部 [size]/[capacity]/[allocator] 等结构。
-		assert.strictEqual(node.value, '"Lorem ipsum...aliqua...');
+		// string-like 节点只有 value, value 必须是 string 本身；
+		// 重建不出完整字符串时丢弃 adapter 的截断 preview，
+		// 也不暴露内部 [size]/[capacity]/[allocator] 等结构。
+		assert.strictEqual(node.value, undefined);
 		assert.strictEqual(node.children, undefined);
 	});
 

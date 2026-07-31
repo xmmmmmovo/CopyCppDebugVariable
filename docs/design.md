@@ -132,21 +132,27 @@ VS Code 公共 API 没有提供“直接取得 Debug Variables/Watch 树节点�
 ### 阶段 E：字符串内容重建
 
 - 扩展 `isStringLikeType` 覆盖 `std::u8string`、`std::pmr::*`、`std::__cxx11::basic_string<...>` / `std::__1::basic_string<...>` 等 ABI 形式。
-- 字符串类节点改为尝试从 char 子节点重建完整文本写入 `value`；当适配器不暴露 char 子节点时保留原展示值，避免内部 buffer / `[size]` / `[capacity]` / `[allocator]` 泄漏。
+- 字符串类节点改为尝试从 char 子节点重建完整文本写入 `value`；当适配器不暴露 char 子节点时**丢弃**原展示值（cppvsdbg 的 truncated preview 同样不是 string 本身，保留下来反而误导），叶子只剩 `type` / `memoryReference`。
 - 详见 `docs/implementation.md` §3.1 和 `docs/testing.md` 第 17-20 条。
 
 ### 阶段 F：字节缓冲作为字符串类叶子
 
 - `isStringLikeType` 进一步覆盖 `std::byte[N]` / `std::byte *`（PMR 背书缓冲场景，cppvsdbg 默认会把它拆成 N 个 `std::byte` 子节点）。
-- `getCharKind` 把 `std::byte` 归为 `utf8`，让 `readStringValue` 能把 `std::byte` 子节点按字节序列重建成 UTF-8 字符串；适配器不暴露 char 子节点时保留原始展示值。
+- `getCharKind` 把 `std::byte` 归为 `utf8`，让 `readStringValue` 能把 `std::byte` 子节点按字节序列重建成 UTF-8 字符串；适配器不暴露 byte 子节点时**丢弃** cppvsdbg 的字节 dump 预览（`0x... {NN '?', ...}`），不再保留为叶子 value。
 - 详见 `docs/implementation.md` §3.1 和 `docs/testing.md` 第 17-20 条。
+
+### 阶段 G：非 string-like 容器展开后丢弃 value
+
+- struct / class / `std::vector<int>` / `std::pmr::monotonic_buffer_resource` 等非 string-like 容器在展开成 children 后，把父节点 adapter 给的 `value` 摘要主动丢掉，避免与子树并存；string-like 节点通过更早的 `isStringLikeType` 拦截已直接 return，value 是重建后的字符串。
+- 详见 `docs/implementation.md` §3 和 `docs/testing.md` 第 17-20 条。
 
 ## 7. 验收标准
 
 - 在 cppdbg 暂停断点时，输入普通标量表达式可复制合法 JSON。
 - 在 Variables/Watch 视图右键任意变量都能看到 `Copy as JSON` / `Save as JSON`，且结果以被点击的节点为根。
 - 右键路径不发送 `evaluate` 请求；数组元素、匿名成员等没有合法表达式的节点同样可复制。
-- 字符串类节点（`std::string` / `std::u8string` / `std::pmr::*` / 自定义 allocator / ABI-tagged `basic_string<...>` / `std::byte[N]` / `std::byte *`）的 `value` 是从 char / byte 子节点重建的完整 UTF-8 / UTF-16 文本；当适配器不暴露 char 子节点时保留适配器展示值，**不**暴露内部 buffer / `[size]` / `[capacity]` 等结构。
+- 字符串类节点（`std::string` / `std::u8string` / `std::pmr::*` / 自定义 allocator / ABI-tagged `basic_string<...>` / `std::byte[N]` / `std::byte *`）在导出的 JSON 中只有 `value` 字段（无 `children`）。`value` 优先是从 char / byte 子节点重建的完整 UTF-8 / UTF-16 文本；无法重建时**丢弃** adapter 的展示值（cppvsdbg 对 `std::byte[N]` 的字节 dump 预览、对 `std::string` 的截断 preview 都不再保留），叶子只剩 `type` / `memoryReference`。
+- 非 string-like 容器在展开成 `children` 后父节点的 `value` 摘要会被丢弃，避免读者同时看到 summary 和完整子树。
 - 结构体/类至少递归展开到配置的最大深度。
 - 数组不会因长度过大无限请求，超限时结果明确标注截断。
 - 同名兄弟变量不会互相覆盖（必要时使用数组或保留节点元数据）。

@@ -274,17 +274,25 @@ export async function readVariableTree(variable: DapVariable, context: ReaderCon
         throw new ReaderCancellationError();
     }
     // 字符串类类型：尝试从 char 子节点重建完整文本写回 value。
-    // 适配器不暴露 char 子节点（cppvsdbg 的 std::string）或解码失败时，
-    // 保留原展示值，不把内部 buffer 暴露给 JSON。
+    // 重建成功：用重建字符串；失败 / 根本没 variablesReference：丢掉 adapter 的 value
+    // （cppvsdbg 对 char[] / std::byte[N] 的字节 dump 预览、std::string 的 truncated
+    // preview 都不应保留），让叶子节点只剩 type / memoryReference，与
+    // "string-like 节点就只有 value, value 就是 string 本身" 的设计对齐。
     if (isStringLikeType(variable.type)) {
         if (variable.variablesReference) {
             try {
                 const reconstructed = await readStringValue(variable, context);
-                if (reconstructed !== undefined) { node.value = reconstructed; }
+                if (reconstructed !== undefined) {
+                    node.value = reconstructed;
+                } else {
+                    delete node.value;
+                }
             } catch (error) {
                 if (error instanceof ReaderCancellationError) { throw error; }
-                // 其他错误一律忽略，保留适配器展示值。
+                delete node.value;
             }
+        } else {
+            delete node.value;
         }
         return node;
     }
