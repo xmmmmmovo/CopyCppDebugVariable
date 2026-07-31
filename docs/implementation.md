@@ -73,7 +73,7 @@ readVariableTree(
 5. 调用 `variables` 读取子节点，优先使用 DAP 的 `start`/`count` 分段读取大数组。
 6. 每读取一个子节点递归处理，并累加全局变量计数。
 7. 发生单个子节点错误时保留已读数据，并在节点 `errors` 数组中记录错误，不应丢弃整个结果。
-8. 字符串类类型（`std::string` / `std::u8string` / `std::wstring` / `std::u16string` / `std::u32string` / `std::string_view` / `std::basic_string<...>` / `std::pmr::*` / `std::__cxx11::basic_string<...>` / `std::__1::basic_string<...>` / `const char *` / `char[N]` / `wchar_t *` 等）一律视为叶子。详见下文 3.1 节。判定由 `variableReader.isStringLikeType()` 完成，按 `type` 字段做正则匹配。
+8. 字符串类类型（`std::string` / `std::u8string` / `std::wstring` / `std::u16string` / `std::u32string` / `std::string_view` / `std::basic_string<...>` / `std::pmr::*` / `std::__cxx11::basic_string<...>` / `std::__1::basic_string<...>` / `const char *` / `char[N]` / `wchar_t *` / `std::byte[N]` / `std::byte *` 等）一律视为叶子。详见下文 3.1 节。判定由 `variableReader.isStringLikeType()` 完成，按 `type` 字段做正则匹配。`std::byte` 出现于 PMR 背书缓冲等场景，cppvsdbg 默认会把它拆成 N 个 `std::byte` 子节点展开；按字节序列重建成 UTF-8 字符串，而不是把 N 个子节点全展开。
 
 注意：DAP 的 `variablesReference` 是调试适配器生成的句柄，不等同于内存地址；它只能在同一调试会话生命周期内使用。
 

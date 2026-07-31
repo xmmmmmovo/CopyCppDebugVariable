@@ -11,5 +11,6 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 - 支持多调试会话：按菜单参数中的 `sessionId` 定位变量所属会话。
 - 字符串类类型（`std::string` / `std::u8string` / `std::wstring` / `std::u16string` / `std::u32string` / `std::string_view` / `std::basic_string<...>` / `std::pmr::*` / `std::__cxx11::basic_string<...>` / `std::__1::basic_string<...>` / `const char *` / `char[N]` / `wchar_t *` 等）不再展开内部 buffer/union；如有 char 子节点则从中重建完整 UTF-8 / UTF-16 文本写入 `value`，否则保留适配器展示值。
 - `isStringLikeType` 现在覆盖 `std::u8string`、`std::pmr::*` 别名，以及被 ABI 命名空间包裹的 `std::__cxx11::basic_string<...>` / `std::__1::basic_string<...>` 等形式（`basic_string<...>` 已对任意 allocator 模板参数生效）。
+- `isStringLikeType` 进一步覆盖 `std::byte[N]` / `std::byte *`（PMR 背书缓冲等场景），按字节序列重建成 UTF-8 字符串；`getCharKind` 把 `std::byte` 归为 `utf8`。
 - 默认 `copy-cpp-debug-variable.maxDepth` 从 32 调整为 8，过深时仍可通过配置调大。
 - Initial release

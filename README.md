@@ -11,7 +11,7 @@ It talks directly to the active Debug Adapter via the [Debug Adapter Protocol](h
 - **Copy / Save from the Variables & Watch context menu** — right-click any node in the Run and Debug view to copy or save it as JSON. No expression needed; the menu passes the node directly.
 - **Copy / Save via a command** — `Copy Debug Variable as JSON` and `Save Debug Variable as JSON` prompt for a Watch expression (`person`, `vec[0]`, `myObject.field`, …) and read the variable tree.
 - **Recursive expansion** — follows `variablesReference` to descend into structs, classes, arrays, pointers, and STL containers.
-- **String-aware leaf handling** — `std::string`, `std::u8string`, `std::wstring`, `std::u16string`, `std::u32string`, `std::string_view`, `std::pmr::*`, ABI-tagged `std::__cxx11::basic_string<…>` / `std::__1::basic_string<…>`, `const char *`, `char[N]`, `wchar_t *`, etc. are treated as leaves: their full UTF-8 / UTF-16 text is reconstructed from char children when the adapter exposes them, otherwise the adapter's display value is kept (no internal buffer / `[size]` / `[capacity]` / `[allocator]` leakage).
+- **String-aware leaf handling** — `std::string`, `std::u8string`, `std::wstring`, `std::u16string`, `std::u32string`, `std::string_view`, `std::pmr::*`, ABI-tagged `std::__cxx11::basic_string<…>` / `std::__1::basic_string<…>`, `const char *`, `char[N]`, `wchar_t *`, `std::byte[N]` / `std::byte *` (e.g. PMR back-buffer), etc. are treated as leaves: their full UTF-8 / UTF-16 text is reconstructed from char children when the adapter exposes them, otherwise the adapter's display value is kept (no internal buffer / `[size]` / `[capacity]` / `[allocator]` leakage).
 - **Safety limits** — `maxDepth`, `maxVariables`, `maxArrayItems`, and `variablePagingSize` cap recursion so a misclick never freezes the host.
 - **Multi-session support** — the context-menu path resolves the correct `DebugSession` from the `sessionId` passed by VS Code, so concurrent debug sessions don't cross-talk.
 - **Result document** — output JSON wraps the variable tree with `schemaVersion`, `source` (`variables` / `watch`), `expression`, `sessionType`, `capturedAt`, `warnings`, `truncated`, and `nodeCount` metadata.
@@ -20,12 +20,12 @@ It talks directly to the active Debug Adapter via the [Debug Adapter Protocol](h
 
 ## Commands
 
-| Command ID | Title | Entry point |
-| --- | --- | --- |
-| `copy-cpp-debug-variable.copyAsJson` | Copy Debug Variable as JSON | Command Palette — prompts for an expression |
-| `copy-cpp-debug-variable.saveAsJson` | Save Debug Variable as JSON | Command Palette — prompts for an expression, then a save dialog |
-| `copy-cpp-debug-variable.copySelectedAsJson` | Copy as JSON | Right-click menu in **Variables** and **Watch** |
-| `copy-cpp-debug-variable.saveSelectedAsJson` | Save as JSON | Right-click menu in **Variables** and **Watch** |
+| Command ID                                     | Title                       | Entry point                                                      |
+| ---------------------------------------------- | --------------------------- | ---------------------------------------------------------------- |
+| `copy-cpp-debug-variable.copyAsJson`         | Copy Debug Variable as JSON | Command Palette — prompts for an expression                     |
+| `copy-cpp-debug-variable.saveAsJson`         | Save Debug Variable as JSON | Command Palette — prompts for an expression, then a save dialog |
+| `copy-cpp-debug-variable.copySelectedAsJson` | Copy as JSON                | Right-click menu in**Variables** and **Watch**       |
+| `copy-cpp-debug-variable.saveSelectedAsJson` | Save as JSON                | Right-click menu in**Variables** and **Watch**       |
 
 The two menu commands are intentionally hidden from the Command Palette (`menus.commandPalette` → `when: false`) — without a context argument they fall back to the input-box flow, and exposing both entry points would be redundant.
 
@@ -42,12 +42,12 @@ The two menu commands are intentionally hidden from the Command Palette (`menus.
 
 This extension contributes the following settings (under `copy-cpp-debug-variable.*`):
 
-| Setting | Default | Min | Description |
-| --- | --- | --- | --- |
-| `maxDepth` | `8` | `1` | Maximum recursion depth when expanding variables. |
-| `maxVariables` | `10000` | `1` | Maximum total number of variable nodes to read. |
-| `maxArrayItems` | `1000` | `1` | Maximum array / vector elements to enumerate. |
-| `variablePagingSize` | `100` | `1` — `1000` | Page size for DAP `variables` requests. |
+| Setting                | Default   | Min               | Description                                       |
+| ---------------------- | --------- | ----------------- | ------------------------------------------------- |
+| `maxDepth`           | `8`     | `1`             | Maximum recursion depth when expanding variables. |
+| `maxVariables`       | `10000` | `1`             | Maximum total number of variable nodes to read.   |
+| `maxArrayItems`      | `1000`  | `1`             | Maximum array / vector elements to enumerate.     |
+| `variablePagingSize` | `100`   | `1` — `1000` | Page size for DAP`variables` requests.          |
 
 ---
 

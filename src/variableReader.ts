@@ -71,6 +71,9 @@ export function isStringLikeType(type: string | undefined): boolean {
     if (/^((const|signed|unsigned)\s+)?char\s*(\*|\[\s*\d*\s*\])$/.test(t)) { return true; }
     // wchar_t / char8_t / char16_t / char32_t 的指针与定长数组
     if (/^((const|signed|unsigned)\s+)?(wchar_t|char8_t|char16_t|char32_t)\s*(\*|\[\s*\d*\s*\])$/.test(t)) { return true; }
+    // std::byte 指针与定长数组（含可选 `const` 前缀）——典型场景是 PMR 的
+    // `std::byte[N]` 背书缓冲，cppvsdbg 会把它当 2048 个 std::byte 子节点展开。
+    if (/^(const\s+)?std::byte\s*(\*|\[\s*\d*\s*\])$/.test(t)) { return true; }
     return false;
 }
 
@@ -86,7 +89,7 @@ export type CharKind = 'utf8' | 'utf16' | 'utf32' | 'unknown';
 export function getCharKind(type: string | undefined): CharKind {
     if (!type) { return 'unknown'; }
     const t = type.replace(/\s+/g, ' ').trim();
-    if (/^(const\s+)?(char8_t|unsigned\s+char|signed\s+char|char)$/.test(t)) { return 'utf8'; }
+    if (/^(const\s+)?(char8_t|unsigned\s+char|signed\s+char|char|std::byte)$/.test(t)) { return 'utf8'; }
     if (/^(const\s+)?char16_t$/.test(t)) { return 'utf16'; }
     if (/^(const\s+)?char32_t$/.test(t)) { return 'utf32'; }
     if (/^(const\s+)?wchar_t$/.test(t)) {
@@ -114,7 +117,7 @@ function inferStringKindFromType(type: string | undefined): CharKind {
     m = /^std::((__cxx11|__1|__y|__z|__abi)::)?basic_string(_view)?\s*<\s*([^,>]+)/.exec(t);
     if (m) { return getCharKind(m[4]); }
     // 裸指针 / 数组：元素类型直接决定。
-    m = /^((const\s+)?(?:signed\s+|unsigned\s+)?)(char8_t|char16_t|char32_t|wchar_t|char)\s*(\*|\[\s*\d*\s*\])$/.exec(t);
+    m = /^((const\s+)?(?:signed\s+|unsigned\s+)?)(char8_t|char16_t|char32_t|wchar_t|char|std::byte)\s*(\*|\[\s*\d*\s*\])$/.exec(t);
     if (m) { return getCharKind(m[3]); }
     return 'unknown';
 }
@@ -320,7 +323,13 @@ export async function readVariableTree(variable: DapVariable, context: ReaderCon
             }
             if (vars.length < context.limits.pageSize || node.truncated) { break; }
         }
-        if (Object.keys(children).length > 0) { node.children = children; }
+        if (Object.keys(children).length > 0) {
+            // 父 node 已展开成子节点，适配器给的 `value` 摘要就冗余了，丢掉以免
+            // 误读。这里只对非 string-like 的容器生效——string-like 分支在更早的
+            // `isStringLikeType` 拦截里已经直接 return，value 是重建后的字符串。
+            node.children = children;
+            delete node.value;
+        }
     } catch (error) {
         node.errors = [error instanceof Error ? error.message : String(error)];
     } finally {

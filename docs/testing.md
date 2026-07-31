@@ -28,10 +28,10 @@
 
 ### 字符串类节点
 
-17. `isStringLikeType` 接受 `std::u8string` / `std::pmr::*` / `std::__cxx11::basic_string<...>` / `std::__1::basic_string<...>` / `std::__y::basic_string<...>`，并继续拒绝 `std::vector<char>` / `std::array<char, N>` / `std::map<std::string, int>` / `std::deque<char>` / `std::list<char>` / `MyString` / 裸 `char` / `wchar_t`。
+17. `isStringLikeType` 接受 `std::u8string` / `std::pmr::*` / `std::__cxx11::basic_string<...>` / `std::__1::basic_string<...>` / `std::__y::basic_string<...>` / `std::byte[N]` / `std::byte *` / `const std::byte[N]`，并继续拒绝 `std::vector<char>` / `std::array<char, N>` / `std::array<std::byte, N>` / `std::map<std::string, int>` / `std::deque<char>` / `std::list<char>` / `MyString` / 裸 `char` / `wchar_t`。`getCharKind` 把 `std::byte` / `const std::byte` 归为 `utf8`。
 18. `parseCharUnits` 解析 `NN '...'` / `0xNN '...'` / `'\xNN'` / `'\uNNNN'` / `[uLU]'X'` / `'X'`，不可识别输入返回 `undefined`。
 19. `readStringValue` 在 cppdbg / cppvsdbg 风格的 char 子节点下重建字符串，对只有 `[size]` / `[capacity]` / `[allocator]` 等命名兄弟节点的情形返回 `undefined`；空 `std::string` 返回 `""` 且不发送 `variables` 请求；分页参数正确；取消时抛 `ReaderCancellationError`。
-20. `readVariableTree` 对 `std::u8string` / `std::string` / `std::u16string` 视为叶子：如有 char 子节点则 `value` 为重建的完整文本；如无 char 子节点则 `value` 保持适配器展示值且不暴露任何内部字段；`std::vector<char>` 等容器仍然展开。
+20. `readVariableTree` 对 `std::u8string` / `std::string` / `std::u16string` 视为叶子：如有 char 子节点则 `value` 为重建的完整文本；如无 char 子节点则 `value` 保持适配器展示值且不暴露任何内部字段；`std::vector<char>` 等容器仍然展开；`std::byte[N]` 同样视为叶子并按 `std::byte` 子节点重建成 UTF-8 字符串。
 
 ## 集成测试矩阵
 
@@ -44,6 +44,7 @@
 | `std::u8string` / `std::wstring` / `std::u16string` / `std::u32string` | 同上，对应编码见 §3.1 |
 | `std::string`（`indexedItems === 0`） | `value: ""`，不发送 `variables` 请求 |
 | `std::pmr::string` / `std::__cxx11::basic_string<...>` / 自定义 allocator | 视为叶子，按 §3.1 走重建或回退 |
+| `std::byte[N]` / `std::byte *`（PMR 背书缓冲） | 视为叶子；如有 `std::byte` 子节点则按字节序列重建成 UTF-8 字符串，否则保留适配器展示值 |
 | null pointer | 不报错，不继续展开 |
 | pointer/reference | 保留地址/类型，防止循环 |
 | `<optimized out>` | 保留展示字符串并给 warning |

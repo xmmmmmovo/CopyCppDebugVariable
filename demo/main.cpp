@@ -105,7 +105,15 @@ struct StringShowcase {
     // --- string with custom (tracking) allocator -----------------------
     TrackingString custom_alloc = "Custom-allocator string (SSO region).";
     TrackingString custom_alloc_long =
-        "A longer custom-allocator string that must heap-allocate via the tracking allocator.";
+        "A longer custom-allocator string that must heap-allocate via the "
+        "tracking allocator.A longer custom-allocator string that must "
+        "heap-allocate via the tracking allocator.A longer custom-allocator "
+        "string that must heap-allocate via the tracking allocator.A longer "
+        "custom-allocator string that must heap-allocate via the tracking "
+        "allocator.A longer custom-allocator string that must heap-allocate "
+        "via the tracking allocator.A longer custom-allocator string that must "
+        "heap-allocate via the tracking allocator.A longer custom-allocator "
+        "string that must heap-allocate via the tracking allocator.";
 
     StringShowcase() {
         very_long.assign(4096, 'x');

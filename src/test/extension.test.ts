@@ -1,6 +1,6 @@
 import * as assert from 'assert';
 import type * as vscode from 'vscode';
-import { DapVariable, ReaderCancellationError, ReaderLimits, isDapVariable, isStringLikeType, parseCharUnits, readStringValue, readVariableTree } from '../variableReader';
+import { DapVariable, ReaderCancellationError, ReaderLimits, getCharKind, isDapVariable, isStringLikeType, parseCharUnits, readStringValue, readVariableTree } from '../variableReader';
 import {
 	DebugCopyDeps,
 	VariableMenuContext,
@@ -86,6 +86,11 @@ suite('isStringLikeType', () => {
 		'char16_t *',
 		'char32_t *',
 		'unsigned char *',
+		// std::byte 指针与定长数组（PMR 背书缓冲等场景）
+		'std::byte[2048]',
+		'const std::byte[2048]',
+		'std::byte *',
+		'const std::byte *',
 		// std::pmr::* 别名
 		'std::pmr::string',
 		'std::pmr::wstring',
@@ -165,7 +170,11 @@ suite('readVariableTree', () => {
 		const variable: DapVariable = { name: 'person', value: result.result, type: result.type, variablesReference: result.variablesReference };
 		const context = makeContext(session);
 		const data = await readVariableTree(variable, context);
-		assert.strictEqual(data.children?.name.value, '"Alice"');
+		// 父 node 在展开 children 后会丢掉 value；name 还有更深的 size 子节点，
+		// 所以这里也应该是 undefined。age/size 是叶子（variablesReference: 0），
+		// 它们的 value 保留。
+		assert.strictEqual(data.value, undefined, 'root with children should drop value');
+		assert.strictEqual(data.children?.name.value, undefined, 'name has size child so its value is dropped');
 		assert.strictEqual(data.children?.name.children?.size.value, '5');
 		assert.strictEqual(data.children?.age.value, '29');
 		assert.ok(calls.includes('variables'));
@@ -236,6 +245,35 @@ suite('readVariableTree', () => {
 			assert.strictEqual(node.value, c.expected, `${c.type} should reconstruct to ${JSON.stringify(c.expected)}`);
 			assert.strictEqual(node.children, undefined, `${c.type} should not expose char children`);
 		}
+	});
+
+	test('treats std::byte[N] as a leaf and reconstructs UTF-8 from byte children', async () => {
+		const session = makeSession(async (cmd) => cmd === 'variables' ? {
+			variables: [
+				{ name: '[0]', value: "72 'H'", type: 'std::byte', variablesReference: 0 },
+				{ name: '[1]', value: "105 'i'", type: 'std::byte', variablesReference: 0 },
+				// cppvsdbg 偶发把多字节 UTF-8 塞进一个子节点
+				{ name: '[2]', value: "'\\xE4\\xBD\\xA0'", type: 'std::byte', variablesReference: 0 },
+				{ name: '[3]', value: "33 '!'", type: 'std::byte', variablesReference: 0 },
+			],
+		} : {});
+		const node = await readVariableTree(
+			{ name: 'pmr_buf', value: '0x555555 {...}', type: 'std::byte[2048]', variablesReference: 7, indexedItems: 4 },
+			makeContext(session),
+		);
+		// 应当从 std::byte 子节点重建为 UTF-8 字符串，而不是再展开 2048 个子节点。
+		assert.strictEqual(node.value, 'Hi你!');
+		assert.strictEqual(node.children, undefined);
+	});
+
+	test('keeps adapter value when std::byte[N] exposes no char children', async () => {
+		const session = makeSession(async (cmd) => cmd === 'variables' ? { variables: [] } : {});
+		const node = await readVariableTree(
+			{ name: 'pmr_buf', value: '0x555555 ' + '{0, 0, 0, ...}', type: 'std::byte[2048]', variablesReference: 7, indexedItems: 4 },
+			makeContext(session),
+		);
+		assert.strictEqual(node.value, '0x555555 ' + '{0, 0, 0, ...}');
+		assert.strictEqual(node.children, undefined);
 	});
 
 	test('still expands non-string container types like std::vector<char>', async () => {
@@ -403,6 +441,34 @@ suite('readVariableTree', () => {
 		const data = await readVariableTree(variable, makeContext(session));
 		assert.strictEqual(data.children, undefined);
 	});
+});
+
+suite('getCharKind', () => {
+	const cases: Array<{ type: string | undefined; expected: 'utf8' | 'utf16' | 'utf32' | 'unknown' }> = [
+		// utf8
+		{ type: 'char', expected: 'utf8' },
+		{ type: 'const char', expected: 'utf8' },
+		{ type: 'unsigned char', expected: 'utf8' },
+		{ type: 'char8_t', expected: 'utf8' },
+		{ type: 'std::byte', expected: 'utf8' },
+		{ type: 'const std::byte', expected: 'utf8' },
+		// utf16
+		{ type: 'char16_t', expected: 'utf16' },
+		{ type: 'const char16_t', expected: 'utf16' },
+		// utf32
+		{ type: 'char32_t', expected: 'utf32' },
+		// wchar_t 跟随宿主平台
+		{ type: 'wchar_t', expected: process.platform === 'win32' ? 'utf16' : 'utf32' },
+		// 不可识别
+		{ type: 'int', expected: 'unknown' },
+		{ type: undefined, expected: 'unknown' },
+		{ type: '', expected: 'unknown' },
+	];
+	for (const c of cases) {
+		test(`classifies ${c.type === undefined ? 'undefined' : JSON.stringify(c.type)}`, () => {
+			assert.strictEqual(getCharKind(c.type), c.expected);
+		});
+	}
 });
 
 suite('parseCharUnits', () => {
