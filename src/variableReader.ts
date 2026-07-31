@@ -98,6 +98,21 @@ export function getCharKind(type: string | undefined): CharKind {
     return 'unknown';
 }
 
+/**
+ * 识别 DAP 子节点字段名是否是 MSVC STL 中"结束"位置的迭代器。
+ *
+ * `std::vector` 在 `_Vector_val` 里有 `_Myfirst` / `_Mylast` / `_Myend` 三个裸指针。
+ * 其中 `_Mylast` 是 one-past-end、`_Myend` 是 capacity 末尾，对它们解引用是 UB。
+ * 但 cppvsdbg 仍会照常 deref 并把指针所指内存当作子节点展示——典型表现是
+ * `_Mylast->xxx` 全是 `<NULL>` / `0` / `<Error reading characters of string.>` 等噪声，
+ * 并且其内部的容器字段（如 `tags.capacity()`）也会读到 461165814791740701 这类垃圾值。
+ *
+ * 跳过它们的子节点展开，但仍保留指针 hex 值与 type/evaluateName，方便定位。
+ */
+function isOnePastEndIterator(name: string): boolean {
+    return name === '_Mylast' || name === '_Myend';
+}
+
 /** 根据字符串父类型推断其子节点期望的字符编码。无法判定时返回 `unknown`。 */
 function inferStringKindFromType(type: string | undefined): CharKind {
     if (!type) { return 'unknown'; }
@@ -120,6 +135,37 @@ function inferStringKindFromType(type: string | undefined): CharKind {
     m = /^((const\s+)?(?:signed\s+|unsigned\s+)?)(char8_t|char16_t|char32_t|wchar_t|char|std::byte)\s*(\*|\[\s*\d*\s*\])$/.exec(t);
     if (m) { return getCharKind(m[3]); }
     return 'unknown';
+}
+
+/**
+ * 解析 cppvsdbg 给 `std::byte[N]` / `std::byte *` 的“字节 dump”展示值。
+ *
+ * 形如 `0x00000001000fed10 {168 '�', 232 '�', 15 '\xf', 0 '\0', 1 '\x1', 0 '\0', ..., ...}`，
+ * 最外层是可选的十六进制地址 + `{<byte>, <byte>, ...}`，其中：
+ *   - `<byte>` 由 `parseCharUnits` 解析（`168 '�'`、`0x61 'a'`、`'\xNN'` 等）
+ *   - 末尾的 `...` 表示截断，跳过即可
+ *   - 整个 `{...}` 为空时返回空数组
+ *
+ * 不可识别的输入返回 `undefined`，调用方按既有路径处理（drop value）。
+ */
+export function parseCppvsdbgByteDump(value: string): readonly number[] | undefined {
+    const m = /^(?:0x[0-9a-fA-F]+\s+)?\{(.*)\}\s*$/.exec(value);
+    if (!m) { return undefined; }
+    const body = m[1];
+    if (body.trim() === '') { return []; }
+    // cppvsdbg 不会在单引号字面量里塞 `,`，所以朴素 split 即可。
+    const entries = body.split(',').map(s => s.trim()).filter(s => s.length > 0);
+    const bytes: number[] = [];
+    for (const entry of entries) {
+        if (entry === '...') { continue; }
+        const units = parseCharUnits(entry);
+        if (!units) { return undefined; }
+        for (const u of units) {
+            if (u > 0xff) { return undefined; }
+            bytes.push(u);
+        }
+    }
+    return bytes;
 }
 
 /**
@@ -273,27 +319,40 @@ export async function readVariableTree(variable: DapVariable, context: ReaderCon
     if (context.token?.isCancellationRequested) {
         throw new ReaderCancellationError();
     }
-    // 字符串类类型：尝试从 char 子节点重建完整文本写回 value。
-    // 重建成功：用重建字符串；失败 / 根本没 variablesReference：丢掉 adapter 的 value
-    // （cppvsdbg 对 char[] / std::byte[N] 的字节 dump 预览、std::string 的 truncated
-    // preview 都不应保留），让叶子节点只剩 type / memoryReference，与
-    // "string-like 节点就只有 value, value 就是 string 本身" 的设计对齐。
+    // 字符串类类型：叶子节点只有 `value`，`value` 必须是 string 本身。
+    // 优先级：
+    //   1) 空容器（indexedItems === 0） → value = ""，不发 variables 请求
+    //   2) 从 char / byte 子节点重建完整文本
+    //   3) 重建失败时回退：cppvsdbg 对 std::byte[N] / std::byte * 的“字节 dump”
+    //      （形如 `0x... {168 '�', 232 '�', ..., ...}`）放在 value 字段里，
+    //      解析出字节并按 UTF-8 解码
+    //   4) 上面都拿不到时丢弃 adapter 展示值（cppvsdbg 对 std::string 的
+    //      truncated preview 不再保留）
     if (isStringLikeType(variable.type)) {
+        if (variable.indexedItems === 0) {
+            node.value = '';
+            return node;
+        }
         if (variable.variablesReference) {
             try {
                 const reconstructed = await readStringValue(variable, context);
                 if (reconstructed !== undefined) {
                     node.value = reconstructed;
-                } else {
-                    delete node.value;
+                    return node;
                 }
             } catch (error) {
                 if (error instanceof ReaderCancellationError) { throw error; }
-                delete node.value;
+                // 非取消异常继续尝试字节 dump 回退
             }
-        } else {
-            delete node.value;
         }
+        if (variable.value) {
+            const bytes = parseCppvsdbgByteDump(variable.value);
+            if (bytes !== undefined) {
+                node.value = new TextDecoder('utf-8').decode(new Uint8Array(bytes));
+                return node;
+            }
+        }
+        delete node.value;
         return node;
     }
     if (!variable.variablesReference) {
@@ -326,6 +385,18 @@ export async function readVariableTree(variable: DapVariable, context: ReaderCon
                     break;
                 }
                 context.count++;
+                if (isOnePastEndIterator(child.name)) {
+                    // MSVC STL 的 one-past-end / capacity-end 指针，不解引用以免
+                    // 触发 cppvsdbg 把 UB 内存当成子节点展开。
+                    children[child.name] = {
+                        name: child.name,
+                        value: child.value,
+                        type: child.type,
+                        evaluateName: child.evaluateName,
+                        memoryReference: child.memoryReference,
+                    };
+                    continue;
+                }
                 const key = Object.prototype.hasOwnProperty.call(children, child.name) ? `${child.name}[${start}]` : child.name;
                 children[key] = await readVariableTree(child, context, depth + 1);
             }

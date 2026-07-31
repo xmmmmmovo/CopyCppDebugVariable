@@ -1,6 +1,6 @@
 import * as assert from 'assert';
 import type * as vscode from 'vscode';
-import { DapVariable, ReaderCancellationError, getCharKind, isDapVariable, isStringLikeType, parseCharUnits, readStringValue, readVariableTree } from '../variableReader';
+import { DapVariable, ReaderCancellationError, getCharKind, isDapVariable, isStringLikeType, parseCharUnits, parseCppvsdbgByteDump, readStringValue, readVariableTree } from '../variableReader';
 import { makeContext, makeSession, request } from './helpers';
 
 suite('isDapVariable type guard', () => {
@@ -221,15 +221,16 @@ suite('readVariableTree', () => {
 		assert.strictEqual(node.children, undefined);
 	});
 
-	test('drops adapter value when std::byte[N] exposes no char children', async () => {
+	test('decodes std::byte[N] value from cppvsdbg byte dump preview', async () => {
 		const session = makeSession(async (cmd) => cmd === 'variables' ? { variables: [] } : {});
 		const node = await readVariableTree(
-			{ name: 'pmr_buf', value: '0x555555 ' + '{0, 0, 0, ...}', type: 'std::byte[2048]', variablesReference: 7, indexedItems: 4 },
+			{ name: 'pmr_buf', value: "0x000000827AAFED60 {72 'H', 105 'i', 33 '!'}", type: 'std::byte[2048]', variablesReference: 7, indexedItems: 4 },
 			makeContext(session),
 		);
-		// string-like 节点只有 value, value 必须是 string 本身；
-		// 重建不出 UTF-8 时把 cppvsdbg 的字节 dump summary 丢掉。
-		assert.strictEqual(node.value, undefined);
+		// cppvsdbg 对 std::byte[N] 不暴露 byte 子节点，而是把字节 dump 直接放进
+		// value 字段（`0x... {<byte>, <byte>, ..., ...}`）。string-like 节点只有 value,
+		// value 必须是 string 本身，所以从 dump 解析出字节并按 UTF-8 解码。
+		assert.strictEqual(node.value, 'Hi!');
 		assert.strictEqual(node.children, undefined);
 	});
 
@@ -251,12 +252,14 @@ suite('readVariableTree', () => {
 			if (cmd === 'variables') { variablesCalls++; }
 			return { variables: [] };
 		});
-		const node = await readVariableTree(
-			{ name: 'empty', value: '""', type: 'std::string', variablesReference: 99, indexedItems: 0 },
-			makeContext(session),
-		);
-		assert.strictEqual(node.value, '');
-		assert.strictEqual(node.children, undefined);
+		for (const variablesReference of [99, 0]) {
+			const node = await readVariableTree(
+				{ name: 'empty', value: '""', type: 'std::string', variablesReference, indexedItems: 0 },
+				makeContext(session),
+			);
+			assert.strictEqual(node.value, '');
+			assert.strictEqual(node.children, undefined);
+		}
 		assert.strictEqual(variablesCalls, 0, 'empty string must not trigger a variables request');
 	});
 
@@ -400,6 +403,72 @@ suite('readVariableTree', () => {
 		const data = await readVariableTree(variable, makeContext(session));
 		assert.strictEqual(data.children, undefined);
 	});
+
+	test('skips _Mylast/_Myend dereference in MSVC vector raw view', async () => {
+		// 模拟 cppvsdbg 对 std::vector 暴露的内部指针。`_Myfirst` 是合法可解引用
+		// 的首元素指针，`_Mylast` / `_Myend` 是 one-past-end / capacity-end，
+		// 对其解引用是 UB。buggy 适配器会把 UB 内存当字段返回，并在它们"内部"的
+		// 子 vector / 子结构继续爆开，导致节点数与字段值全面失真。
+		const childCalls: number[] = [];
+		const session = makeSession(async (cmd, args) => {
+			if (cmd !== 'variables') { return {}; }
+			const ref = (args as { variablesReference: number }).variablesReference;
+			childCalls.push(ref);
+			if (ref === 1) {
+				// vector 顶层：[capacity] / [allocator] / [Raw View]（含 _Myfirst/_Mylast/_Myend）
+				return {
+					variables: [
+						{ name: '[capacity]', value: '3', type: 'unsigned __int64', variablesReference: 0 },
+						{ name: '[allocator]', value: 'allocator', type: 'std::allocator<Person>', variablesReference: 0 },
+						{ name: '[Raw View]', value: '', type: 'std::_Vector_val<std::_Simple_types<Person>>', variablesReference: 2 },
+					],
+				};
+			}
+			if (ref === 2) {
+				// _Vector_val：三个裸指针
+				return {
+					variables: [
+						{ name: '_Myfirst', value: '0x000001a4341aa800', type: 'Person *', variablesReference: 10 },
+						{ name: '_Mylast', value: '0x000001a4341aa818', type: 'Person *', variablesReference: 11 },
+						{ name: '_Myend', value: '0x000001a4341aa818', type: 'Person *', variablesReference: 12 },
+					],
+				};
+			}
+			if (ref === 10) {
+				// 合法的首元素——应继续展开
+				return {
+					variables: [
+						{ name: 'name', value: '"Alice"', type: 'std::string', variablesReference: 0 },
+						{ name: 'age', value: '29', type: 'int', variablesReference: 0 },
+					],
+				};
+			}
+			if (ref === 11 || ref === 12) {
+				// 模拟 cppvsdbg 把 UB 内存当作 Person 暴露的垃圾子节点。
+				// 任何针对这两个 ref 的子请求都不应发生。
+				throw new Error(`unexpected recursion into one-past-end iterator (ref=${ref})`);
+			}
+			return { variables: [] };
+		});
+		const ctx = makeContext(session);
+		const data = await readVariableTree({ name: 'people', type: 'std::vector<Person>', variablesReference: 1, indexedItems: 3 }, ctx);
+		const raw = data.children?.['[Raw View]'];
+		assert.ok(raw, '[Raw View] should be present');
+		const first = raw.children?._Myfirst;
+		const last = raw.children?._Mylast;
+		const end = raw.children?._Myend;
+		// _Myfirst 是合法的：仍递归
+		assert.ok(first?.children?.name, '_Myfirst must keep being expanded');
+		assert.strictEqual(first?.children?.age?.value, '29');
+		// _Mylast / _Myend：保留指针 hex 值但不解引用
+		assert.strictEqual(last?.value, '0x000001a4341aa818');
+		assert.strictEqual(last?.children, undefined, '_Mylast must not be dereferenced');
+		assert.strictEqual(end?.value, '0x000001a4341aa818');
+		assert.strictEqual(end?.children, undefined, '_Myend must not be dereferenced');
+		// 计数只计入"已访问"的节点（_Mylast/_Myend 算 1，不再算它们子树）
+		assert.ok(!childCalls.includes(11), 'must not issue variables request for _Mylast');
+		assert.ok(!childCalls.includes(12), 'must not issue variables request for _Myend');
+	});
 });
 
 suite('getCharKind', () => {
@@ -459,6 +528,47 @@ suite('parseCharUnits', () => {
 			assert.deepStrictEqual(parseCharUnits(c.input), c.expected);
 		});
 	}
+});
+
+suite('parseCppvsdbgByteDump', () => {
+	test('extracts bytes from cppvsdbg byte dump with address prefix', () => {
+		assert.deepStrictEqual(
+			parseCppvsdbgByteDump("0x000000827AAFED60 {72 'H', 105 'i', 33 '!'}"),
+			[72, 105, 33],
+		);
+	});
+
+	test('extracts bytes from cppvsdbg byte dump without address prefix', () => {
+		assert.deepStrictEqual(
+			parseCppvsdbgByteDump("{72 'H', 105 'i', 33 '!'}"),
+			[72, 105, 33],
+		);
+	});
+
+	test('decodes hex-escaped glyphs and skips truncation marker', () => {
+		// 末尾的 `...,` 是截断标记，应跳过；中间的 `'\xf'` 由 parseCharUnits 解析。
+		assert.deepStrictEqual(
+			parseCppvsdbgByteDump("{168 '�', 232 '�', 15 '\\xf', 0 '\\0', ..., ...}"),
+			[168, 232, 15, 0],
+		);
+	});
+
+	test('returns empty array for empty braces', () => {
+		assert.deepStrictEqual(parseCppvsdbgByteDump('{}'), []);
+		assert.deepStrictEqual(parseCppvsdbgByteDump('0x000000827AAFED60 {}'), []);
+	});
+
+	test('returns undefined for non-byte-dump input', () => {
+		assert.strictEqual(parseCppvsdbgByteDump('"hello"'), undefined);
+		assert.strictEqual(parseCppvsdbgByteDump('0x555555 "hello"'), undefined);
+		assert.strictEqual(parseCppvsdbgByteDump('garbage'), undefined);
+		assert.strictEqual(parseCppvsdbgByteDump(''), undefined);
+	});
+
+	test('returns undefined when any entry cannot be parsed', () => {
+		// "{0}" 单独一个数字没有 glyph 形式，parseCharUnits 解析不了。
+		assert.strictEqual(parseCppvsdbgByteDump('{0, 1, 2}'), undefined);
+	});
 });
 
 suite('readStringValue', () => {

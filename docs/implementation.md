@@ -82,13 +82,19 @@ readVariableTree(
 对于步骤 8 命中的字符串类节点，`readVariableTree` 把它视为叶子
 返回（无 `children`）。`value` 的优先级是：
 
-1. 如果该节点有非零 `variablesReference`，调用 `readStringValue`
-   尝试从 char / byte 子节点拼出完整字符串并写入 `value`。
-2. 重建失败（无 char 子节点 / 解析失败 / 超 `maxArrayItems` 截断）或
-   整个节点没有 `variablesReference`：**主动丢弃 adapter 展示值**。
-   cppvsdbg 对 `std::byte[N]` 的字节 dump 预览（如
-   `0x... {168 '�', 232 '�', ...}`）、对 `std::string` 的截断 preview
-   （如 `"Lorem ipsum...aliqua..."`）都不应保留——它们不是 string 本身，
+1. 空容器（`indexedItems === 0`）：`value` 直接为 `""`，**不**发送 `variables`
+   请求。
+2. 该节点有非零 `variablesReference`：调用 `readStringValue` 尝试从
+   char / byte 子节点拼出完整字符串并写入 `value`。
+3. 上述都没有拿到时，回退到 adapter `value` 字段——对 cppvsdbg 给
+   `std::byte[N]` / `std::byte *` 的字节 dump（形如
+   `0x... {168 '�', 232 '�', 15 '\xf', 0 '\0', ..., ...}`）调用
+   `parseCppvsdbgByteDump` 解析出字节并按 UTF-8 解码，写入 `value`。
+4. 全部失败（无 char 子节点 / 解析失败 / 超 `maxArrayItems` 截断 /
+   整个节点没有 `variablesReference` / `value` 不是字节 dump 格式）：
+   **主动丢弃 adapter 展示值**。
+   cppvsdbg 对 `std::string` 的截断 preview
+   （如 `"Lorem ipsum...aliqua..."`）不应保留——它不是 string 本身，
    套在叶子节点上只会误导读者。
 
 这条路径不会让适配器内部的 buffer / union / `[size]` / `[capacity]` /
@@ -105,20 +111,35 @@ readVariableTree(
    子节点；`[size]` / `[capacity]` / `[allocator]` / `[Raw View]` / `[More]`
    等命名形式会被自然过滤掉。
 5. 按索引从 `0` 起依次解析每个子节点的 `value`，缺位或解析失败立刻返回
-   `undefined`，让 `readVariableTree` 丢弃 adapter 展示值。
+   `undefined`，让 `readVariableTree` 走回退（字节 dump → 仍失败则 drop）。
 6. UTF-8 通过 `TextDecoder('utf-8')` 拼字节；UTF-16 / UTF-32 通过
    `String.fromCharCode` 在 0x8000 字节的 chunk 上拼接（保留 surrogate pair）。
    `wchar_t` 的位宽按宿主 `process.platform` 推断（`win32` → UTF-16，
    其余 → UTF-32）。
 
+`parseCppvsdbgByteDump` 的格式：
+
+```text
+[0x<hex-address> ]{<byte>, <byte>, ..., ...}
+```
+
+其中每个 `<byte>` 由 `parseCharUnits` 解析（`168 '�'` / `0x61 'a'` /
+`'\xNN'` 等）；末尾的 `...` 是 cppvsdbg 的截断标记，直接跳过；空
+`{...}` 返回 `[]`。整段不是这个格式（例如 `"Alice"` / `0x555555 "Alice"`
+这种带引号的字符串渲染）就返回 `undefined`，让 `readVariableTree` 走
+drop 分支。`std::byte` 的字节序列若不是合法 UTF-8，TextDecoder 会按
+默认行为替换为 `�`。
+
 适配器差异：
 - cppdbg / cppvsdbg 都可能暴露 char 子节点（如
   `[0]` … `[size-1]`，`type: char` / `char8_t` / `char16_t` / `wchar_t`）。
 - cppvsdbg 对部分 `std::string` 只返回截断的展示值而不暴露 char
-  子节点（例如 `very_long` 仅含 `[size]` / `[capacity]`），此时重建失败，
-  `value` 主动丢弃（不再保留截断 preview），但**不会**暴露任何内部结构。
-- cppvsdbg 对 `std::byte[N]`（典型如 PMR 背书缓冲）通常以 `<hex> {NN '?', ...}`
-  形式预览，且不会暴露 byte 子节点；同样丢弃 value，不展开为 2048 个子节点。
+  子节点（例如 `very_long` 仅含 `[size]` / `[capacity]`），此时重建失败、
+  字节 dump 解析也失败（value 是 `"Lorem...aliqua..."` 形式），`value`
+  主动丢弃（不再保留截断 preview），但**不会**暴露任何内部结构。
+- cppvsdbg 对 `std::byte[N]`（典型如 PMR 背书缓冲）通常以
+  `<hex> {NN '?', ...}` 形式预览，且不会暴露 byte 子节点；走字节 dump
+  回退解析后按 UTF-8 解码作为 `value`，不展开为 2048 个子节点。
 - `memoryReference` 在 cppvsdbg 的 char 子节点上只是字节值的零扩展，
   不是真实地址，不要用于重建。
 
@@ -176,7 +197,7 @@ readVariableTree(
 
 `source` 区分入口：`variables` 表示来自 Variables/Watch 右键菜单，`watch` 表示来自命令面板输入的表达式。`expression` 在菜单路径下取 `evaluateName`，缺失时回退到变量名——它只是给人看的标识和默认文件名来源，不参与逻辑判断，时间戳同理。
 
-对字符串类节点，`data.value` 是从 char / byte 子节点重建的完整 UTF-8 / UTF-16 文本（详见 §3.1）；无法重建时 `value` 直接丢弃（仅保留 `type` / `memoryReference`），节点不会展开成内部结构。
+对字符串类节点，`data.value` 是从 char / byte 子节点重建的完整 UTF-8 / UTF-16 文本，或从 cppvsdbg 字节 dump 解析出的字节序列（详见 §3.1）；再退一步时 `value` 直接丢弃（仅保留 `type` / `memoryReference`），节点不会展开成内部结构。
 
 ## 5. 值转换策略
 
