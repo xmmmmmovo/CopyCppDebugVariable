@@ -1,0 +1,104 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & Release VSIX
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Cache pnpm store
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/pnpm/store
+          key: ${{ runner.os }}-pnpm-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install vsce (VS Code packaging tool)
+        run: pnpm exec --package=@vscode/vsce -- vsce --version
+
+      - name: Sync package.json version with tag
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          echo "Tag version: ${VERSION}"
+          # Bump source-of-truth files so the packaged VSIX carries the tag version.
+          node -e "
+            const fs = require('fs');
+            const pkgPath = 'package.json';
+            const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+            pkg.version = '${VERSION}';
+            fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n');
+          "
+          cat package.json
+
+      - name: Package extension
+        run: pnpm exec vsce package --no-dependencies
+
+      - name: List build artifacts
+        run: ls -la *.vsix
+
+      - name: Collect commits since previous release tag
+        id: commits
+        run: |
+          # Sort tags by creation (oldest first), find the previous tag, then dump
+          # commit titles between it (exclusive) and the current tag (exclusive).
+          PREV_TAG=$(git tag --sort=creatordate | grep -E '^v[0-9]+\.[0-9]+$' | grep -v "^${GITHUB_REF_NAME}$" | tail -n 1 || true)
+
+          if [ -z "${PREV_TAG}" ]; then
+            echo "No previous tag found, using repo root as range start."
+            RANGE="${GITHUB_REF_NAME}"
+          else
+            echo "Previous tag: ${PREV_TAG}"
+            RANGE="${PREV_TAG}..${GITHUB_REF_NAME}"
+          fi
+
+          # Pull only the subject line of each commit in the range, sorted oldest -> newest.
+          COMMIT_TITLES=$(git log "${RANGE}" --no-merges --pretty=format:'- %s')
+
+          {
+            echo "commits<<EOF"
+            echo "${COMMIT_TITLES}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: false
+          body: |
+            ## Changes since previous release
+
+            ${{ steps.commits.outputs.commits }}
+          files: |
+            *.vsix
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
