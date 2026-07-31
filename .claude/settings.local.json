@@ -3,7 +3,9 @@
     "allow": [
       "Bash(git -C . rev-parse --show-toplevel)",
       "WebFetch(domain:code.visualstudio.com)",
-      "WebSearch"
+      "WebSearch",
+      "Bash(pnpm run *)",
+      "Bash(./node_modules/.bin/mocha)"
     ]
   }
 }
