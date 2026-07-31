@@ -69,6 +69,7 @@ suite('isStringLikeType', () => {
 	const stringCases = [
 		'std::string',
 		'std::wstring',
+		'std::u8string',
 		'std::u16string',
 		'std::u32string',
 		'std::string_view',
@@ -85,6 +86,18 @@ suite('isStringLikeType', () => {
 		'char16_t *',
 		'char32_t *',
 		'unsigned char *',
+		// std::pmr::* 别名
+		'std::pmr::string',
+		'std::pmr::wstring',
+		'std::pmr::u8string',
+		'std::pmr::u16string',
+		'std::pmr::u32string',
+		'std::pmr::string_view',
+		// ABI 命名空间包裹的 basic_string（libstdc++ __cxx11 / libc++ __1 / __y / __abi）
+		'std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >',
+		'std::__1::basic_string<char, std::char_traits<char>, std::allocator<char> >',
+		'std::__cxx11::basic_string_view<char, std::char_traits<char> >',
+		'std::__y::basic_string<char, std::char_traits<char>, std::allocator<char> >',
 		// 兼容多余/不规则空白
 		'std::basic_string<char>',
 		'  std::string  ',
@@ -102,10 +115,19 @@ suite('isStringLikeType', () => {
 		'Person',
 		'std::vector<int>',
 		'std::vector<char>',
+		'std::vector<std::string>',
+		'std::deque<char>',
+		'std::list<char>',
 		'std::array<char, 16>',
 		'std::map<std::string, int>',
 		'signed int',
 		'unsigned int',
+		'char',                                // 裸标量，不是指针/数组
+		'wchar_t',
+		'MyString',                            // 用户自定义类型
+		'std::basic_string_factory<int>',      // false-positive 防护
+		'std::__cxx11::vector<int>',           // ABI 命名空间，但容器不是 string
+		'std::__cxx11::allocator<char>',       // 名字像 string，但不是
 	];
 	for (const t of nonStringCases) {
 		test(`rejects ${t === undefined ? 'undefined' : JSON.stringify(t)}`, () => {

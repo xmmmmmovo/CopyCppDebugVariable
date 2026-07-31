@@ -59,10 +59,14 @@ export function isDapVariable(value: unknown): value is DapVariable {
 export function isStringLikeType(type: string | undefined): boolean {
     if (!type) { return false; }
     const t = type.replace(/\s+/g, ' ').trim();
-    // std::basic_string<char, ...> / std::basic_string_view<char, ...>
-    if (/^std::basic_string(_view)?\s*</.test(t)) { return true; }
-    // std::string / std::wstring / std::u16string / std::u32string / std::string_view（无模板实参别名）
-    if (/^std::(string|wstring|u16string|u32string|string_view)$/.test(t)) { return true; }
+    // std::basic_string / std::basic_string_view，可选套在 ABI 命名空间内
+    // （libstdc++ 的 __cxx11、libc++ 的 __1/__y/__z/__abi）。正则只关心
+    // `basic_string<` 前缀，第三个模板参数（allocator）任意值都被覆盖。
+    if (/^std::((__cxx11|__1|__y|__z|__abi)::)?basic_string(_view)?\s*</.test(t)) { return true; }
+    // std::pmr::* 别名
+    if (/^std::pmr::(string|wstring|u8string|u16string|u32string|string_view)$/.test(t)) { return true; }
+    // std::* 直接别名（无模板实参）
+    if (/^std::(string|wstring|u8string|u16string|u32string|string_view)$/.test(t)) { return true; }
     // char / const char 指针与定长数组（含可选 `signed` / `unsigned` 前缀）
     if (/^((const|signed|unsigned)\s+)?char\s*(\*|\[\s*\d*\s*\])$/.test(t)) { return true; }
     // wchar_t / char8_t / char16_t / char32_t 的指针与定长数组
