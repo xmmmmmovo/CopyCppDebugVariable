@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - 'v[0-9]+.[0-9]+'
+      - 'v[0-9]+\.[0-9]+\.[0-9]+'
 
 permissions:
   contents: write
@@ -68,7 +68,7 @@ jobs:
         run: |
           # Sort tags by creation (oldest first), find the previous tag, then dump
           # commit titles between it (exclusive) and the current tag (exclusive).
-          PREV_TAG=$(git tag --sort=creatordate | grep -E '^v[0-9]+\.[0-9]+$' | grep -v "^${GITHUB_REF_NAME}$" | tail -n 1 || true)
+          PREV_TAG=$(git tag --sort=creatordate | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | grep -v "^${GITHUB_REF_NAME}$" | tail -n 1 || true)
 
           if [ -z "${PREV_TAG}" ]; then
             echo "No previous tag found, using repo root as range start."

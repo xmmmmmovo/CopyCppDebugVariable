@@ -1,4 +1,4 @@
-# Copy Cpp Debug Variable
+# Copy Cpp Debug Variable Extension
 
 A VS Code extension that recursively expands a C/C++ debug variable (or Watch expression) and copies the result as JSON to the clipboard, or saves it to a file.
 
