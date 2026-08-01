@@ -3,6 +3,10 @@
   "displayName": "Copy Cpp Debug Variable",
   "description": "Copy cpp variable recursively in JSON",
   "version": "0.0.1",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/xmmmmmovo/CopyCppDebugVariableExtension.git"
+  },
   "engines": {
     "vscode": "^1.125.0"
   },

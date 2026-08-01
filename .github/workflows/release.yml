@@ -40,9 +40,6 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Install vsce (VS Code packaging tool)
-        run: pnpm exec --package=@vscode/vsce -- vsce --version
-
       - name: Sync package.json version with tag
         run: |
           VERSION=${GITHUB_REF_NAME#v}
@@ -58,7 +55,7 @@ jobs:
           cat package.json
 
       - name: Package extension
-        run: pnpm exec vsce package --no-dependencies
+        run: pnpm dlx @vscode/vsce package --no-dependencies
 
       - name: List build artifacts
         run: ls -la *.vsix

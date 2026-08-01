@@ -13,3 +13,9 @@ vsc-extension-quickstart.md
 **/*.ts
 **/.vscode-test.*
 demo/**
+.claude/**
+.github/**
+docs/**
+misc/**
+pnpm-lock.yaml
+**/.mocharc.*
