@@ -7,6 +7,7 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 ## [Unreleased]
 
 - 新增配置 `copy-cpp-debug-variable.showSuccessNotification`（默认 false）：关闭后复制 / 保存成功不再弹出右下角提示，警告与错误提示不受影响。
+- 修复 `std::byte[N]` / `std::byte *` 只显示 ~10 条 byte 子节点的退化：`readMemory` 走 DAP spec 字段 `data`（保留 `bytes` 别名兜底），并新增 `tryEvaluateForFullByteDump` 路径——按 MSVC format specifier（`,N` size hint、`!` raw、`,s8` UTF-8）依次 evaluate，任一返回非平凡的完整 byte dump 即物化全部 N 个 child；`parseCppvsdbgByteDump` 改用 per-entry 正则 matchAll，避免 `,` 切错带 `,` glyph 的 entry；`formatByteAsCppvsdbg` 对 `\`、`'`、`,` 做转义以保持 dump 字符串结构稳定；同步接受 DAP spec 的 `indexedVariables` 字段（`indexedItems` 作为别名保留）。
 
 ## v0.0.1
 

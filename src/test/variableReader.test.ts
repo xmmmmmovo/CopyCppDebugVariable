@@ -1,6 +1,6 @@
 import * as assert from 'assert';
 import type * as vscode from 'vscode';
-import { DapVariable, ReaderCancellationError, getCharKind, isDapVariable, isStringLikeType, parseCharUnits, parseCppvsdbgByteDump, readStringValue, readVariableTree } from '../variableReader';
+import { DapVariable, ReaderCancellationError, formatByteAsCppvsdbg, getCharKind, isDapVariable, isStringLikeType, parseCharUnits, parseCppvsdbgByteDump, readStringValue, readVariableTree } from '../variableReader';
 import { makeContext, makeSession, request } from './helpers';
 
 suite('isDapVariable type guard', () => {
@@ -150,18 +150,20 @@ suite('readVariableTree', () => {
 			{ type: 'unsigned char *', value: '0x555555 ""' },
 		];
 		for (const c of cases) {
-			// 模拟适配器返回的是非 char 的“噪声”子节点（如 cppvsdbg 的 [size]/[capacity]
-			// 或根本无子节点），此时不应重建字符串，也不应让内部字段泄漏；
-			// adapter 的截断 preview（或 std::byte[N] 的字节 dump）也不应作为
-			// 叶子 value 保留——string-like 节点只有 value, value 必须是 string 本身。
+			// 没有 char 子节点时走不通 reconstruction；先前会删掉 value 然后 return，
+			// 留下一个全空节点。现在改成落到通用分支把 children 展出来，让用户能看到
+			// cppvsdbg 实际给的字段名/值（典型如 [size] / [capacity] / [allocator]
+			// 或 std::pmr::basic_string 的 _Mysize / _Myres / _Altr），用来定位
+			// "为什么重建不出来"。
 			let variablesCalls = 0;
 			const session = makeSession(async (cmd) => {
 				if (cmd === 'variables') { variablesCalls++; }
 				return { variables: [{ name: '[size]', value: '0', type: 'unsigned __int64', variablesReference: 0 }] };
 			});
 			const node = await readVariableTree({ name: 's', value: c.value, type: c.type, variablesReference: 42 }, makeContext(session));
-			assert.strictEqual(node.children, undefined, `${c.type} should not expose children`);
 			assert.strictEqual(node.value, undefined, `${c.type} should drop adapter value when no char children`);
+			assert.ok(node.children, `${c.type} should expose adapter children when reconstruction fails`);
+			assert.ok(node.children?.['[size]'], `${c.type} should preserve [size] child for diagnosis`);
 			assert.ok(variablesCalls >= 1, `${c.type} should consult variables to look for char children`);
 		}
 	});
@@ -221,17 +223,355 @@ suite('readVariableTree', () => {
 		assert.strictEqual(node.children, undefined);
 	});
 
-	test('decodes std::byte[N] value from cppvsdbg byte dump preview', async () => {
+	test('materializes std::byte[N] cppvsdbg byte dump as virtual children', async () => {
+		// cppvsdbg 对 std::byte[N] 偶尔不展开 byte 子节点而是把字节 dump 直接放进
+		// value 字段（`0x... {<byte>, <byte>, ...}`）。reader 把这些 entry 抽出来
+		// 当作 std::byte 虚拟 children——跟 IDE Variables panel 手动展开后看到的
+		// `[0] = 72 'H'` 等是同一种形态，调用方不再需要走 readMemory / evaluate
+		// refresh 那两条不稳定的绕路。
 		const session = makeSession(async (cmd) => cmd === 'variables' ? { variables: [] } : {});
 		const node = await readVariableTree(
 			{ name: 'pmr_buf', value: "0x000000827AAFED60 {72 'H', 105 'i', 33 '!'}", type: 'std::byte[2048]', variablesReference: 7, indexedItems: 4 },
 			makeContext(session),
 		);
-		// cppvsdbg 对 std::byte[N] 不暴露 byte 子节点，而是把字节 dump 直接放进
-		// value 字段（`0x... {<byte>, <byte>, ..., ...}`）。string-like 节点只有 value,
-		// value 必须是 string 本身，所以从 dump 解析出字节并按 UTF-8 解码。
+		assert.strictEqual(node.value, undefined, 'byte buffer must not carry both value and children');
+		assert.ok(node.children, 'byte buffer should expose its dump as virtual children');
+		assert.strictEqual(Object.keys(node.children ?? {}).length, 3);
+		assert.strictEqual(node.children?.['[0]']?.value, "72 'H'");
+		assert.strictEqual(node.children?.['[0]']?.type, 'std::byte');
+		assert.strictEqual(node.children?.['[1]']?.value, "105 'i'");
+		assert.strictEqual(node.children?.['[2]']?.value, "33 '!'");
+	});
+
+	test('reads every byte of std::byte[N] even when indexedItems exceeds maxArrayItems', async () => {
+		// PMR 背书缓冲典型是 `std::byte[2048]` 这种"长度已知、内容当二进制读"的类型。
+		// cppvsdbg 把全部 N 个 std::byte 子节点展开；readStringValue 必须绕过
+		// maxArrayItems（默认 1000）才能拿到剩下的 1048 字节，否则只能依赖 cppvsdbg
+		// 给的 ~16 字节 truncated preview，2048 - 16 ≈ 2032 字节静默丢。
+		const total = 2048;
+		const bytes = Array.from({ length: total }, (_, i) => i % 256);
+		const session = makeSession(async (cmd, args) => {
+			if (cmd !== 'variables') { return {}; }
+			const a = args as { start: number; count: number };
+			const items = Array.from({ length: Math.min(a.count, total - a.start) }, (_, i) => ({
+				name: `[${a.start + i}]`,
+				value: `${bytes[a.start + i]} 'x'`,
+				type: 'std::byte',
+				variablesReference: 0,
+			}));
+			return { variables: items };
+		});
+		const decoded = await readStringValue(
+			{ name: 'pmr_buf', type: 'std::byte[2048]', variablesReference: 7, indexedItems: total },
+			makeContext(session, { pageSize: 100, maxArrayItems: 1000 }),
+		);
+		assert.ok(decoded, 'should reconstruct every byte, not just the first 1000');
+		assert.strictEqual(decoded.length, total, 'all 2048 bytes must round-trip through UTF-8 decode (modulo control bytes lost as Unicode replacements)');
+	});
+
+	test('pmr_buf-style byte buffer reconstructs past maxArrayItems through DAP variables', async () => {
+		// 端到端：模拟 demo 里 pmr_buf（std::byte[2048]，cppvsdbg 给完整 N 个 byte 子节点），
+		// readVariableTree 必须把所有 2048 字节拼回来，不能在被 maxArrayItems 卡住后退化成
+		// 半截 cppvsdbg 字节 dump 预览。
+		const total = 2048;
+		const bytes = new Uint8Array(total);
+		// 头一段塞点非零内容模拟 PMR 池里实际写入的字节
+		for (let i = 0; i < 200; i++) { bytes[i] = (i * 7 + 1) & 0xff; }
+		const session = makeSession(async (cmd, args) => {
+			if (cmd !== 'variables') { return {}; }
+			const a = args as { start: number; count: number };
+			const items = Array.from({ length: Math.min(a.count, total - a.start) }, (_, i) => ({
+				name: `[${a.start + i}]`,
+				value: `${bytes[a.start + i]} 'x'`,
+				type: 'std::byte',
+				variablesReference: 0,
+			}));
+			return { variables: items };
+		});
+		const node = await readVariableTree(
+			{ name: 'pmr_buf', value: "0x000000a7692fe820 {..., ...}", type: 'std::byte[2048]', variablesReference: 7, indexedItems: total },
+			makeContext(session, { pageSize: 100, maxArrayItems: 1000 }),
+		);
+		assert.ok(node.value, 'pmr_buf should rebuild a value out of all 2048 byte children, not the truncated preview');
+		assert.strictEqual(node.type, 'std::byte[2048]');
+		assert.strictEqual(node.children, undefined);
+	});
+
+	test('materialises folded std::byte[N] via DAP evaluate using MSVC format specifiers', async () => {
+		// cppvsdbg 在首屏对 std::byte[2048] 这种"全是二进制"字段默认折叠——只回
+		// 字节 dump 预览进 value、不带 variablesReference。如果 DAP `readMemory`
+		// 也不支持（DAP spec 字段 `data` 在老 cppvsdbg 里没实现），reader 退到
+		// `evaluate` 试若干 MSVC format specifier（`,N` pointer size hint、
+		// `,!` raw 格式、`,s8` UTF-8 字符串）——任一让 cppvsdbg 在 result 字符串里
+		// 把完整 2048 byte dump 出来，reader 解析后物化 N 个虚拟 child。旧版用
+		// `,e` 当 expand 是错的（MSVC spec 里 `,e` 是 float sci notation）。
+		const total = 2048;
+		const bytes = new Uint8Array(total);
+		for (let i = 0; i < total; i++) { bytes[i] = (i * 7 + 1) & 0xff; }
+		const calls: string[] = [];
+		const session = makeSession(async (cmd, args) => {
+			calls.push(cmd);
+			if (cmd === 'evaluate') {
+				const expr = (args as { expression: string }).expression;
+				// 模拟 cppvsdbg 对 `pmr_buf,2048` 把完整 byte dump 给到 result：
+				// 返回的 result 必须包含全部 2048 条 entry，reader 才能物化所有 child。
+				if (expr.includes(',2048') || expr.endsWith(',!') || expr.endsWith(',s8')) {
+					const entries = Array.from(bytes, (b) => formatByteAsCppvsdbg(b)).join(', ');
+					return {
+						result: `0x000000385713ECD0 {${entries}}`,
+						type: 'std::byte[2048]',
+						// 注意：不带 variablesReference——reader 必须从 result 字符串
+						// 解析出完整 byte dump 而不是去查 paginated variables。
+					};
+				}
+				// 默认 evaluate（无 specifier）只给 truncated preview
+				return {
+					result: "0x000000385713ECD0 {104 'h', 19 '\\x13', 87 'W', 56 '8', 0 '\\0', 0 '\\0', 0 '\\0', 0 '\\0', 0 '\\0', ..., ...}",
+					type: 'std::byte[2048]',
+				};
+			}
+			return {};
+		});
+		const node = await readVariableTree(
+			{
+				name: 'pmr_buf',
+				value: "0x000000385713ECD0 {104 'h', 19 '\\x13', 87 'W', 56 '8', 0 '\\0', 0 '\\0', 0 '\\0', 0 '\\0', 0 '\\0', ..., ...}",
+				type: 'std::byte[2048]',
+				evaluateName: 'strings.pmr_buf',
+				memoryReference: '0x000000385713ECD0',
+			},
+			makeContext(session, { pageSize: 100, maxArrayItems: 1000 }),
+		);
+		assert.ok(calls.includes('evaluate'), 'must consult evaluate when readMemory is unavailable');
+		assert.strictEqual(node.value, undefined, 'byte buffer must not carry both value and children');
+		assert.ok(node.children, 'must expose all 2048 bytes as virtual children');
+		assert.strictEqual(Object.keys(node.children ?? {}).length, total, `must expose all ${total} bytes from evaluated byte dump`);
+		assert.strictEqual(node.children?.['[0]']?.value, formatByteAsCppvsdbg(bytes[0]!));
+		assert.strictEqual(node.children?.['[1024]']?.value, formatByteAsCppvsdbg(bytes[1024]!));
+		assert.strictEqual(node.children?.['[2047]']?.value, formatByteAsCppvsdbg(bytes[2047]!));
+	});
+
+	test('per-index DAP evaluate iterates all 2048 byte children of std::byte[N]', async () => {
+		// pmr_buf 这种 cppvsdbg 折叠的 std::byte[2048]，readMemory 在某些 session
+		// 不工作、evaluate refresh 也拿不到 ref、但 IDE 里手动展开能看到全部 2048 个
+		// 字节——reader 用 `${name}[i]` 形式 per-index evaluate 把所有 child 拉出来，
+		// 跟 IDE Variables 面板展开后是同一份数据。
+		const total = 2048;
+		const bytes = new Uint8Array(total);
+		for (let i = 0; i < total; i++) { bytes[i] = i & 0xff; }
+		const calls: string[] = [];
+		const session = makeSession(async (cmd, args) => {
+			calls.push(cmd);
+			if (cmd === 'evaluate') {
+				const expr = (args as { expression: string }).expression;
+				const m = /\[(\d+)\]/.exec(expr);
+				const i = m ? parseInt(m[1], 10) : -1;
+				if (i >= 0 && i < total) {
+					return { result: `${bytes[i]} 'x'`, type: 'std::byte' };
+				}
+				// refresh via evaluate (no bracket): refuse variablesReference
+				return { result: "0x... {..., ...}", type: 'std::byte[2048]' };
+			}
+			return {};
+		});
+		const node = await readVariableTree(
+			{
+				name: 'pmr_buf',
+				value: "0x0000004BB7AFE7A0 {216 '', 230 '', 111 'o', 211 '', ..., ...}",
+				type: 'std::byte[2048]',
+				evaluateName: 'strings.pmr_buf',
+				memoryReference: '0x0000004BB7AFE7A0',
+				indexedItems: total,
+			},
+			makeContext(session, { pageSize: 100, maxArrayItems: 1000 }),
+		);
+		// 整张表 2048 个 children 都得在；最后一轮 children 加载完就退出。
+		assert.strictEqual(node.value, undefined);
+		assert.strictEqual(Object.keys(node.children ?? {}).length, total);
+		assert.strictEqual(node.children?.['[0]']?.value, "0 'x'");
+		assert.strictEqual(node.children?.['[256]']?.value, `${bytes[256]} 'x'`);
+		assert.strictEqual(node.children?.['[2047]']?.value, `${bytes[2047]} 'x'`);
+	});
+
+	test('falls back to truncated dump entries when per-index evaluate fails', async () => {
+		// per-index evaluate 也失败时（cppvsdbg 把 `${name}[i]` 直接 reject），退回
+		// truncated dump 那 10 条 entry 作为虚拟 children——这是接口能拿到的所有数据。
+		const session = makeSession(async (cmd) => {
+			if (cmd === 'evaluate') { return { result: '', type: 'std::byte[2048]' }; }
+			return {};
+		});
+		const raw = "0x0000004BB7AFE7A0 {56 '8', 231 '', 156 '', 135 '', 75 'K', 0 '\\0', 0 '\\0', 0 '\\0', 0 '\\0', 0 '\\0', ..., ...}";
+		const node = await readVariableTree(
+			{
+				name: 'pmr_buf',
+				value: raw,
+				type: 'std::byte[2048]',
+				evaluateName: 'strings.pmr_buf',
+				memoryReference: '0x0000004BB7AFE7A0',
+			},
+			makeContext(session),
+		);
+		assert.strictEqual(node.value, undefined, 'byte buffer must not carry both value and children');
+		assert.ok(node.children);
+		// per-index evaluate 全返回空 result → 第一条就 break，accumulator 永远为空；
+		// iterateByteBufferChildren 返回 undefined → 落到 byte dump fallback。
+		assert.strictEqual(Object.keys(node.children ?? {}).length, 10);
+		assert.strictEqual(node.children?.['[0]']?.value, "56 '8'");
+		assert.strictEqual(node.children?.['[4]']?.value, "75 'K'");
+		assert.strictEqual(node.children?.['[5]']?.value, "0 '\\0'");
+	});
+
+	test('non-byte string-like still decodes cppvsdbg byte dump to UTF-8', async () => {
+		// std::byte[N] / std::byte * 现在走"虚拟 children"路径；其它 string-like
+		// 类型（`char *` / `const char *` / `wchar_t *` 等通过 `,s8` 这种 format spec
+		// 也可能拿到字节 dump 形态）继续走原本的 UTF-8 decode 兜底，避免 std::byte 的
+		// 行为扩散到真正的文本字符串。
+		const session = makeSession(async () => ({}));
+		const node = await readVariableTree(
+			{
+				name: 'short_sso',
+				value: "0x000000385713ECD0 {72 'H', 105 'i', 33 '!'}",
+				type: 'const char *',
+				evaluateName: 'strings.short_sso',
+			},
+			makeContext(session),
+		);
 		assert.strictEqual(node.value, 'Hi!');
 		assert.strictEqual(node.children, undefined);
+	});
+
+	test('reads std::byte[N] via DAP readMemory and synthesises all bytes as virtual children', async () => {
+		// cppvsdbg 折叠的 std::byte[2048] 没有 variablesReference、也没有子节点——
+		// 上一版走 readMemory 拿到 raw bytes 后做 UTF-8 decode，对二进制 buffer 是错的
+		// （只有前几个 ASCII-ish 字节解出来）。正确做法：直接按 cppvsdbg "<dec> '<glyph>'"
+		// 形态物化成 N 个虚拟 child，跟 IDE Variables 面板展开看到的 [0]..[2047]
+		// 完全一致；UTF-8 decode 那条仅保留给 char[N] / char * 文本类兜底。
+		const total = 2048;
+		const bytes = new Uint8Array(total);
+		for (let i = 0; i < total; i++) { bytes[i] = (i * 7 + 1) & 0xff; }
+		let base64: string;
+		if (typeof Buffer !== 'undefined') {
+			base64 = Buffer.from(bytes).toString('base64');
+		} else {
+			let bin = '';
+			for (let i = 0; i < bytes.length; i++) { bin += String.fromCharCode(bytes[i]!); }
+			base64 = btoa(bin);
+		}
+		const calls: string[] = [];
+		const session = makeSession(async (cmd, args) => {
+			calls.push(cmd);
+			if (cmd === 'readMemory') {
+				// DAP spec：响应 body 用 `data` 字段携带 base64 bytes（`address` 是
+				// 起始地址，`unreadableBytes` 是末段不可读字节数）。部分 adapter
+				// 历史上用 `bytes` 别名——reader 必须两个都接受，下一条测试覆盖
+				// 别名路径。
+				return { address: '0x0000004BB7AFE7A0', data: base64, unreadableBytes: 0 };
+			}
+			return {};
+		});
+		const node = await readVariableTree(
+			{
+				name: 'pmr_buf',
+				value: "0x0000004BB7AFE7A0 {..., ...}",
+				type: 'std::byte[2048]',
+				evaluateName: 'strings.pmr_buf',
+				memoryReference: '0x0000004BB7AFE7A0',
+			},
+			makeContext(session),
+		);
+		assert.ok(calls.includes('readMemory'), 'readMemory should be tried when memoryReference is set');
+		assert.ok(!calls.includes('evaluate'), 'evaluate should be skipped when readMemory succeeds');
+		assert.strictEqual(node.value, undefined, 'byte buffer must not carry both value and children');
+		assert.ok(node.children, 'byte buffer should expose its raw bytes as virtual children');
+		assert.strictEqual(Object.keys(node.children ?? {}).length, total, `must expose all ${total} bytes, not a truncated subset`);
+		for (let i = 0; i < total; i++) {
+			const child: { name: string; value?: string; type?: string } | undefined = node.children?.[`[${i}]`];
+			assert.ok(child, `child [${i}] should exist`);
+			assert.strictEqual(child!.type, 'std::byte');
+			assert.strictEqual(child!.value, formatByteAsCppvsdbg(bytes[i]!), `[${i}] should be formatted as cppvsdbg "<dec> '<glyph>'"`);
+		}
+	});
+
+	test('readMemory accepts `bytes` alias for adapters that do not follow DAP spec field name', async () => {
+		// DAP spec 把 base64 字段叫 `data`。但部分 adapter（包括较旧版本的
+		// cppvsdbg）历史上用 `bytes` 别名——为了兼容，reader 必须两个都接受。
+		const bytes = new Uint8Array([0x41, 0x00, 0x42]);
+		let base64: string;
+		if (typeof Buffer !== 'undefined') {
+			base64 = Buffer.from(bytes).toString('base64');
+		} else {
+			let bin = '';
+			for (let i = 0; i < bytes.length; i++) { bin += String.fromCharCode(bytes[i]!); }
+			base64 = btoa(bin);
+		}
+		const session = makeSession(async (cmd) => {
+			if (cmd === 'readMemory') { return { bytes: base64 }; }
+			return {};
+		});
+		const node = await readVariableTree(
+			{ name: 'b', type: 'std::byte[3]', memoryReference: '0x1', value: '' },
+			makeContext(session),
+		);
+		assert.strictEqual(Object.keys(node.children ?? {}).length, 3);
+		assert.strictEqual(node.children?.['[0]']?.value, `65 'A'`);
+		assert.strictEqual(node.children?.['[1]']?.value, `0 '\\0'`);
+		assert.strictEqual(node.children?.['[2]']?.value, `66 'B'`);
+	});
+
+	test('readMemory uses DAP-spec `indexedVariables` for size hint', async () => {
+		// DAP spec 把 size hint 字段叫 `indexedVariables`，cppvsdbg 历史上用 `indexedItems`
+		// 别名。reader 两个都接受——直接传 `indexedVariables` 时 readMemory 应该按这个
+		// 尺寸去请求，而不是 fallback 到 4096。
+		let requestedCount: number | undefined;
+		const base64 = Buffer.alloc(8).toString('base64');
+		const session = makeSession(async (cmd, args) => {
+			if (cmd === 'readMemory') {
+				requestedCount = (args as { count: number }).count;
+				return { data: base64 };
+			}
+			return {};
+		});
+		await readVariableTree(
+			{ name: 'b', type: 'std::byte[128]', memoryReference: '0x1', indexedVariables: 128, value: '' },
+			makeContext(session),
+		);
+		assert.strictEqual(requestedCount, 128, 'readMemory count must follow DAP-spec indexedVariables');
+	});
+
+	test('readMemory uses `indexedItems` alias for backwards compatibility', async () => {
+		// cppvsdbg 历史上用 `indexedItems`，仍要兼容。
+		let requestedCount: number | undefined;
+		const base64 = Buffer.alloc(8).toString('base64');
+		const session = makeSession(async (cmd, args) => {
+			if (cmd === 'readMemory') {
+				requestedCount = (args as { count: number }).count;
+				return { data: base64 };
+			}
+			return {};
+		});
+		await readVariableTree(
+			{ name: 'b', type: 'std::byte[64]', memoryReference: '0x1', indexedItems: 64, value: '' },
+			makeContext(session),
+		);
+		assert.strictEqual(requestedCount, 64, 'readMemory count must follow legacy indexedItems alias');
+	});
+
+	test('readMemory uses `address` field from response if memoryReference missing', async () => {
+		// 部分 adapter 把 readMemory 响应里的 `address`（首字节实际地址）跟
+		// 原始 memoryReference 区分对待。当原始 memoryReference 缺失时
+		// 应该用响应里的 address 作为兜底。我们的 reader 在 result 里不依赖
+		// address 字段（只取 raw bytes），但仍记录到 node 上方便用户排错。
+		const base64 = Buffer.from([0x41, 0x42]).toString('base64');
+		const session = makeSession(async (cmd) => {
+			if (cmd === 'readMemory') { return { address: '0xDEADBEEF', data: base64 }; }
+			return {};
+		});
+		const node = await readVariableTree(
+			{ name: 'b', type: 'std::byte[2]', memoryReference: '0x1', value: '' },
+			makeContext(session),
+		);
+		assert.strictEqual(Object.keys(node.children ?? {}).length, 2);
+		assert.strictEqual(node.memoryReference, '0x1', 'original memoryReference should be preserved');
 	});
 
 	test('still expands non-string container types like std::vector<char>', async () => {
@@ -263,7 +603,7 @@ suite('readVariableTree', () => {
 		assert.strictEqual(variablesCalls, 0, 'empty string must not trigger a variables request');
 	});
 
-	test('drops adapter value when std::string exposes no char children', async () => {
+	test('drops adapter value but keeps children when std::string exposes no char children', async () => {
 		const session = makeSession(async (cmd) => cmd === 'variables' ? {
 			variables: [
 				{ name: '[size]', value: '300', type: 'unsigned __int64', variablesReference: 0 },
@@ -275,11 +615,48 @@ suite('readVariableTree', () => {
 			{ name: 'long_str', value: '"Lorem ipsum...aliqua...', type: 'std::string', variablesReference: 7, indexedItems: 300 },
 			makeContext(session),
 		);
-		// string-like 节点只有 value, value 必须是 string 本身；
-		// 重建不出完整字符串时丢弃 adapter 的截断 preview，
-		// 也不暴露内部 [size]/[capacity]/[allocator] 等结构。
+		// string-like 节点没有 char 子节点 → 重建失败：
+		//   - adapter 的截断 preview (`"Lorem ipsum...aliqua..."`) 不应保留为 value
+		//   - 但 variablesReference 还在 → 落到通用分支把 children 展开，
+		//     让用户看到 [size] / [capacity] / [allocator] 这些实际字段
 		assert.strictEqual(node.value, undefined);
-		assert.strictEqual(node.children, undefined);
+		assert.ok(node.children, 'long_str should expose adapter children when reconstruction fails');
+		assert.strictEqual(node.children?.['[size]']?.value, '300');
+		assert.strictEqual(node.children?.['[capacity]']?.value, '300');
+		assert.ok(node.children?.['[allocator]']);
+	});
+
+	test('exposes MSVC internal layout for std::pmr::basic_string when no char children', async () => {
+		// pmr_str = std::pmr::basic_string<char, ..., std::pmr::polymorphic_allocator<char>>。
+		// cppvsdbg 对它不暴露 char buffer 子节点（数据在 monotonic_buffer_resource 池里），
+		// 只把 MSVC 内部布局（_Mysize / _Myres / _Altr / _Buf）当作子节点返回。
+		// 重建失败时应当让这些内部字段以 children 形式落地，而不是把节点清空。
+		const session = makeSession(async (cmd) => cmd === 'variables' ? {
+			variables: [
+				{ name: '_Mysize', value: '43', type: 'unsigned __int64', variablesReference: 0 },
+				{ name: '_Myres', value: '63', type: 'unsigned __int64', variablesReference: 0 },
+				{ name: '_Altr', value: 'allocator', type: 'std::pmr::polymorphic_allocator<char>', variablesReference: 0 },
+				{ name: '_Buf', value: '0x000000217719e9f0', type: 'std::_Container_proxy', variablesReference: 99 },
+			],
+		} : {});
+		const node = await readVariableTree(
+			{
+				name: 'pmr_str',
+				type: 'std::basic_string<char,std::char_traits<char>,std::pmr::polymorphic_allocator<char>>',
+				evaluateName: 'this->pmr_str',
+				variablesReference: 7,
+				indexedItems: 1,
+			},
+			makeContext(session),
+		);
+		assert.strictEqual(node.value, undefined, 'pmr_str adapter value must be dropped when reconstruction fails');
+		assert.strictEqual(node.type, 'std::basic_string<char,std::char_traits<char>,std::pmr::polymorphic_allocator<char>>');
+		assert.strictEqual(node.evaluateName, 'this->pmr_str');
+		assert.ok(node.children, 'pmr_str should expose MSVC internal layout when no char children');
+		assert.strictEqual(node.children?.['_Mysize']?.value, '43');
+		assert.strictEqual(node.children?.['_Myres']?.value, '63');
+		assert.ok(node.children?._Altr);
+		assert.ok(node.children?._Buf);
 	});
 
 	test('marks truncated when max depth reached', async () => {
@@ -499,6 +876,37 @@ suite('getCharKind', () => {
 	}
 });
 
+suite('formatByteAsCppvsdbg', () => {
+	test('renders null byte as 0 \'\\0\'', () => {
+		assert.strictEqual(formatByteAsCppvsdbg(0), `0 '\\0'`);
+	});
+	test('renders control bytes as \\xNN escapes', () => {
+		assert.strictEqual(formatByteAsCppvsdbg(0x0f), `15 '\\xf'`);
+		assert.strictEqual(formatByteAsCppvsdbg(0x7f), `127 '\\x7f'`);
+		assert.strictEqual(formatByteAsCppvsdbg(0x01), `1 '\\x1'`);
+	});
+	test('renders printable ASCII directly', () => {
+		assert.strictEqual(formatByteAsCppvsdbg(0x41), `65 'A'`);
+		assert.strictEqual(formatByteAsCppvsdbg(0x20), `32 ' '`);
+		assert.strictEqual(formatByteAsCppvsdbg(0x7e), `126 '~'`);
+	});
+	test('escapes backslash, single-quote, and comma so dump concatenation stays well-formed', () => {
+		// PMR 缓冲内容里就会出现 `\` (0x5c)、`'` (0x27)、`,` (0x2c)。如果不
+		// 对它们转义，dump 字符串连起来后会被切错——这是 tryEvaluateForFullByteDump
+		// 路径上 cppvsdbg 把 2048 条 entry 都塞进一个 result 时的硬约束。
+		assert.strictEqual(formatByteAsCppvsdbg(0x5c), `92 '\\\\'`);
+		assert.strictEqual(formatByteAsCppvsdbg(0x27), `39 '\\''`);
+		assert.strictEqual(formatByteAsCppvsdbg(0x2c), `44 '\\,'`);
+	});
+	test('renders high bytes as Latin-1 single char', () => {
+		// cppvsdbg 也是 byte → char 直接映射（高位字节按 Latin-1 单字符渲染）。
+		// 高字节不强制 \x 转义——把单字节当 char 直接显示，跟 cppvsdbg 同形态。
+		assert.strictEqual(formatByteAsCppvsdbg(0x80), `128 ''`);
+		assert.strictEqual(formatByteAsCppvsdbg(0xe8), `232 'è'`);
+		assert.strictEqual(formatByteAsCppvsdbg(0xff), `255 'ÿ'`);
+	});
+});
+
 suite('parseCharUnits', () => {
 	const cases: Array<{ input: string | undefined; expected: readonly number[] | undefined }> = [
 		// 1) <decimal> '<glyph>' —— cppdbg、cppvsdbg 主流
@@ -577,13 +985,15 @@ suite('readStringValue', () => {
 		const session = makeSession(async (cmd) => {
 			if (cmd === 'variables') {
 				variablesCalls++;
-				return { variables: [
-					{ name: '[0]', value: "72 'H'", type: 'char', variablesReference: 0 },
-					{ name: '[1]', value: "101 'e'", type: 'char', variablesReference: 0 },
-					{ name: '[2]', value: "108 'l'", type: 'char', variablesReference: 0 },
-					{ name: '[3]', value: "108 'l'", type: 'char', variablesReference: 0 },
-					{ name: '[4]', value: "111 'o'", type: 'char', variablesReference: 0 },
-				] };
+				return {
+					variables: [
+						{ name: '[0]', value: "72 'H'", type: 'char', variablesReference: 0 },
+						{ name: '[1]', value: "101 'e'", type: 'char', variablesReference: 0 },
+						{ name: '[2]', value: "108 'l'", type: 'char', variablesReference: 0 },
+						{ name: '[3]', value: "108 'l'", type: 'char', variablesReference: 0 },
+						{ name: '[4]', value: "111 'o'", type: 'char', variablesReference: 0 },
+					]
+				};
 			}
 			return {};
 		});
