@@ -43,6 +43,8 @@ export function makeDeps(overrides: Partial<DebugCopyDeps> & { session?: vscode.
 		showWarning: overrides.showWarning ?? ((m: string) => { calls.warning.push(m); }),
 		showError: overrides.showError ?? ((m: string) => { calls.error.push(m); }),
 		readLimits: overrides.readLimits ?? (() => DEFAULT_LIMITS),
+		// 与产品默认值保持一致：想断言成功提示的用例需显式打开。
+		readShowSuccessNotification: overrides.readShowSuccessNotification ?? (() => false),
 		now: overrides.now ?? (() => new Date('2026-01-01T00:00:00.000Z')),
 	};
 	return Object.assign(deps, { calls });

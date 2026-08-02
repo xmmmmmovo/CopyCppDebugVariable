@@ -3,6 +3,8 @@ import { DapVariable, DapVariableNode, ReaderContext, ReaderLimits, isDapVariabl
 
 export const DEFAULT_LIMITS: ReaderLimits = { maxDepth: 8, maxVariables: 10000, maxArrayItems: 1000, pageSize: 100 };
 
+export const DEFAULT_SHOW_SUCCESS_NOTIFICATION = false;
+
 export const SCHEMA_VERSION = 1;
 
 export interface EvaluateResponse { result?: string; type?: string; evaluateName?: string; variablesReference?: number; memoryReference?: string; }
@@ -42,6 +44,8 @@ export interface DebugCopyDeps {
     showWarning(message: string): void;
     showError(message: string): void;
     readLimits(): ReaderLimits;
+    /** 成功提示（复制 / 保存完成）是否弹出，警告与错误不受影响。 */
+    readShowSuccessNotification(): boolean;
     now(): Date;
 }
 
@@ -52,6 +56,15 @@ export function readLimitsFromConfig(get: <T>(key: string, defaultValue: T) => T
         maxArrayItems: get('maxArrayItems', DEFAULT_LIMITS.maxArrayItems),
         pageSize: get('variablePagingSize', DEFAULT_LIMITS.pageSize),
     };
+}
+
+export function readShowSuccessNotificationFromConfig(get: <T>(key: string, defaultValue: T) => T): boolean {
+    return get('showSuccessNotification', DEFAULT_SHOW_SUCCESS_NOTIFICATION);
+}
+
+/** 成功提示走配置开关，失败提示始终展示。 */
+function notifySuccess(deps: DebugCopyDeps, message: string): void {
+    if (deps.readShowSuccessNotification()) { deps.showInfo(message); }
 }
 
 export function buildResultDocument(args: { expression: string; sessionType: string; data: DapVariableNode; count: number; now: Date; source?: ResultSource }): ResultDocument {
@@ -170,7 +183,7 @@ export async function copyVariableAsJson(deps: DebugCopyDeps, arg?: unknown): Pr
     try {
         const document = await readDocument(deps, target);
         await deps.writeClipboard(JSON.stringify(document, null, 2));
-        deps.showInfo(`已复制变量 ${target.expression}（${document.nodeCount} 个节点）`);
+        notifySuccess(deps, `已复制变量 ${target.expression}（${document.nodeCount} 个节点）`);
     } catch (error) {
         if (isCancellation(error)) { return; }
         const message = error instanceof Error ? error.message : String(error);
@@ -187,7 +200,7 @@ export async function saveVariableAsJson(deps: DebugCopyDeps, arg?: unknown): Pr
         const path = await deps.showSaveDialog(buildDefaultFileName(target.expression));
         if (!path) { return; }
         await deps.writeFile(path, Buffer.from(text, 'utf8'));
-        deps.showInfo(`已保存到 ${path}`);
+        notifySuccess(deps, `已保存到 ${path}`);
     } catch (error) {
         if (isCancellation(error)) { return; }
         const message = error instanceof Error ? error.message : String(error);

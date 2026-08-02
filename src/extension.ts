@@ -1,8 +1,13 @@
 import * as vscode from 'vscode';
-import { DebugCopyDeps, copyVariableAsJson, readLimitsFromConfig, saveVariableAsJson } from './debugCopy';
+import { DebugCopyDeps, copyVariableAsJson, readLimitsFromConfig, readShowSuccessNotificationFromConfig, saveVariableAsJson } from './debugCopy';
 
 /** 右键菜单只提供 sessionId，需要自己维护 id -> DebugSession 的映射。 */
 const sessions = new Map<string, vscode.DebugSession>();
+
+/** 每次调用都重新读配置，用户改设置后无需重启扩展。 */
+function getConfigValue<T>(key: string, defaultValue: T): T {
+    return vscode.workspace.getConfiguration('copy-cpp-debug-variable').get<T>(key, defaultValue);
+}
 
 function makeDeps(): DebugCopyDeps {
     return {
@@ -27,7 +32,8 @@ function makeDeps(): DebugCopyDeps {
         showInfo: (message: string) => { void vscode.window.showInformationMessage(message); },
         showWarning: (message: string) => { void vscode.window.showWarningMessage(message); },
         showError: (message: string) => { void vscode.window.showErrorMessage(message); },
-        readLimits: () => readLimitsFromConfig(<T,>(key: string, defaultValue: T) => vscode.workspace.getConfiguration('copy-cpp-debug-variable').get<T>(key, defaultValue)),
+        readLimits: () => readLimitsFromConfig(getConfigValue),
+        readShowSuccessNotification: () => readShowSuccessNotificationFromConfig(getConfigValue),
         now: () => new Date(),
     };
 }

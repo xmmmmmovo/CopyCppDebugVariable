@@ -52,7 +52,7 @@ suite('debug variables context menu', () => {
 			}
 			return { variables: [] };
 		});
-		const deps = makeDeps({ session, showInputBox: async () => { throw new Error('should not prompt'); } });
+		const deps = makeDeps({ session, showInputBox: async () => { throw new Error('should not prompt'); }, readShowSuccessNotification: () => true });
 		await copyVariableAsJson(deps, menuContext({ name: 'alice', value: '{...}', type: 'Person', evaluateName: 'alice', variablesReference: 5 }));
 		assert.ok(!commands.includes('evaluate'));
 		const payload = JSON.parse(deps.calls.clipboard[0]);

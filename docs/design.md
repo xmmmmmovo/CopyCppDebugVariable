@@ -92,6 +92,7 @@ VS Code 公共 API 没有提供“直接取得 Debug Variables/Watch 树节点�
 - `copy-cpp-debug-variable.maxVariables`：默认 10000。
 - `copy-cpp-debug-variable.maxArrayItems`：默认 1000。
 - `copy-cpp-debug-variable.variablePagingSize`：默认 100。
+- `copy-cpp-debug-variable.showSuccessNotification`：默认 false。控制复制 / 保存成功后的右下角提示；默认不打扰，警告与错误提示始终展示。
 - `copy-cpp-debug-variable.includeMetadata`：默认 true。
 - `copy-cpp-debug-variable.stringifySpecialValues`：默认 true。
 

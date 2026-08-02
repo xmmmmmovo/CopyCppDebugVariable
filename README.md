@@ -48,6 +48,7 @@ This extension contributes the following settings (under `copy-cpp-debug-variabl
 | `maxVariables`       | `10000` | `1`             | Maximum total number of variable nodes to read.   |
 | `maxArrayItems`      | `1000`  | `1`             | Maximum array / vector elements to enumerate.     |
 | `variablePagingSize` | `100`   | `1` — `1000` | Page size for DAP`variables` requests.          |
+| `showSuccessNotification` | `false` | —          | Show the bottom-right toast after a successful copy / save. Off by default; warnings and errors always show. |
 
 ---
 

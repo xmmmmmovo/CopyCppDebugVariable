@@ -95,6 +95,11 @@
           "default": 100,
           "minimum": 1,
           "maximum": 1000
+        },
+        "copy-cpp-debug-variable.showSuccessNotification": {
+          "type": "boolean",
+          "default": false,
+          "description": "Show a bottom-right notification after a successful copy / save. Off by default; warnings and errors are always shown."
         }
       }
     }
