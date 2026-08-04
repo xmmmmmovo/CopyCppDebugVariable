@@ -3,6 +3,12 @@
   "displayName": "Copy Cpp Debug Variable",
   "description": "Copy cpp variable recursively in JSON",
   "version": "0.0.1",
+  "publisher": "xmmmmmovo",
+  "license": "MIT",
+  "homepage": "https://github.com/xmmmmmovo/CopyCppDebugVariableExtension",
+  "bugs": {
+    "url": "https://github.com/xmmmmmovo/CopyCppDebugVariableExtension/issues"
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/xmmmmmovo/CopyCppDebugVariableExtension.git"

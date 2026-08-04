@@ -37,8 +37,17 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pnpm-
 
+      - name: Cache VS Code download
+        uses: actions/cache@v4
+        with:
+          path: .vscode-test
+          key: ${{ runner.os }}-vscode-test
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      - name: Run extension tests
+        run: xvfb-run -a pnpm test
 
       - name: Sync package.json version with tag
         run: |
@@ -59,6 +68,13 @@ jobs:
 
       - name: List build artifacts
         run: ls -la *.vsix
+
+      - name: Upload VSIX artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vsix
+          path: ./*.vsix
+          if-no-files-found: error
 
       - name: Collect commits since previous release tag
         id: commits
@@ -99,3 +115,57 @@ jobs:
           fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-marketplace:
+    name: Publish to VS Code Marketplace
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Sync package.json version with tag
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          # Keep package.json's version in sync with the tag so vsce's
+          # publish-time checks see the same version as the packaged VSIX.
+          node -e "
+            const fs = require('fs');
+            const pkgPath = 'package.json';
+            const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+            pkg.version = '${VERSION}';
+            fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n');
+          "
+
+      - name: Download built VSIX
+        uses: actions/download-artifact@v4
+        with:
+          name: vsix
+
+      - name: Authenticate as managed identity (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subject: repo:${{ github.repository }}:ref:${{ github.ref }}
+          audience: api://AzureADTokenExchange
+          allow-no-subscriptions: true
+
+      - name: Publish to VS Code Marketplace
+        run: pnpm dlx @vscode/vsce publish --azure-credential --packagePath ./*.vsix
