@@ -6,7 +6,12 @@ suite('debugCopy pure helpers', () => {
 	test('readLimitsFromConfig reads from getter', () => {
 		const cfg: Record<string, number> = { maxDepth: 5, maxVariables: 100, maxArrayItems: 10, variablePagingSize: 25 };
 		const limits = readLimitsFromConfig(<T,>(key: string, def: T) => (cfg[key] as T) ?? def);
-		assert.deepStrictEqual(limits, { maxDepth: 5, maxVariables: 100, maxArrayItems: 10, pageSize: 25 });
+		assert.deepStrictEqual(limits, { maxDepth: 5, maxVariables: 100, maxArrayItems: 10, pageSize: 25, mergeByteBufferIntoValue: true });
+	});
+
+	test('readLimitsFromConfig reads mergeByteBufferIntoValue toggle', () => {
+		const limits = readLimitsFromConfig(<T,>(key: string, def: T) => (key === 'mergeByteBufferIntoValue' ? false as T : def));
+		assert.strictEqual(limits.mergeByteBufferIntoValue, false);
 	});
 
 	test('readLimitsFromConfig falls back to defaults', () => {

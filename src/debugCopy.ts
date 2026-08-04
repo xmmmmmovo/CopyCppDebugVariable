@@ -1,7 +1,7 @@
 import type * as vscode from 'vscode';
 import { DapVariable, DapVariableNode, ReaderContext, ReaderLimits, isDapVariable, readVariableTree, request } from './variableReader';
 
-export const DEFAULT_LIMITS: ReaderLimits = { maxDepth: 8, maxVariables: 10000, maxArrayItems: 1000, pageSize: 100 };
+export const DEFAULT_LIMITS: ReaderLimits = { maxDepth: 8, maxVariables: 10000, maxArrayItems: 1000, pageSize: 100, mergeByteBufferIntoValue: true };
 
 export const DEFAULT_SHOW_SUCCESS_NOTIFICATION = false;
 
@@ -55,6 +55,7 @@ export function readLimitsFromConfig(get: <T>(key: string, defaultValue: T) => T
         maxVariables: get('maxVariables', DEFAULT_LIMITS.maxVariables),
         maxArrayItems: get('maxArrayItems', DEFAULT_LIMITS.maxArrayItems),
         pageSize: get('variablePagingSize', DEFAULT_LIMITS.pageSize),
+        mergeByteBufferIntoValue: get('mergeByteBufferIntoValue', DEFAULT_LIMITS.mergeByteBufferIntoValue),
     };
 }
 

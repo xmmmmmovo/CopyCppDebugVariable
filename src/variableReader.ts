@@ -27,6 +27,15 @@ function getIndexedCount(variable: { indexedVariables?: number; indexedItems?: n
     return variable.indexedVariables ?? variable.indexedItems;
 }
 
+/**
+ * per-index evaluate 连续 miss 多少次才判定 cppvsdbg 不再应答。
+ *
+ * cppvsdbg 对 `std::byte[N]` 的单条索引偶发返回空 result（典型是 0x00 字节），
+ * 单个 miss 就 break 会把数组截在 preview 那 ~10 条；需要连续足够多次 miss 才
+ * 能确信真的到上限了，同时避免全失败时白白打满 2048 个 round trip。
+ */
+const MAX_CONSECUTIVE_MISSES = 8;
+
 export interface DapVariableNode {
     name: string;
     value?: string;
@@ -44,6 +53,13 @@ export interface ReaderLimits {
     maxVariables: number;
     maxArrayItems: number;
     pageSize: number;
+    /**
+     * `std::byte[N]` / `std::byte *` 字节 buffer 是否合并进 `value` 字符串
+     * （string-like 叶子）。开：字节能按 UTF-8 解码成文本就合并成 value，
+     * 二进制（解码含 U+FFFD 替换符）退回物化 children；关：一律物化全部
+     * 字节 children。
+     */
+    mergeByteBufferIntoValue: boolean;
 }
 
 export interface ReaderContext {
@@ -186,22 +202,36 @@ export function parseCppvsdbgByteDump(value: string): readonly number[] | undefi
     if (!m) { return undefined; }
     const body = m[1];
     if (body.trim() === '') { return []; }
-    // per-entry 正则 matchAll：`(\d+)\s*'(?:\\.|[^'\\])*'`
-    // - `(\d+)` 抓 decimal
-    // - `'(?:\\.|[^'\\])*'` 抓 glyph（支持 `\\.` 转义和裸字面字符）
-    // 这里直接复用 parseCharUnits 内部 regex 的等价形式，避免重复定义。
-    const entryRe = /(\d+)\s*'(?:\\.|[^'\\])*'/g;
+    // per-entry 正则 matchAll。一条 entry 有三种形态：
+    //   1) `[0x]NN '<glyph>'` —— 数字（可选 hex 前缀）+ glyph（MSVC 默认渲染）
+    //   2) `[0x]NN`          —— 裸数字（`,x` 之类的 hex/dec 数组视图常见）
+    //   3) `'<glyph>'`        —— 裸 glyph（`'\x18'`、`'a'`，交给 parseCharUnits）
+    // 数字 + glyph 必须作为一个整体匹配，否则 `24 'a'` 会被数成 24 和 97 两个 byte；
+    // glyph 内的 `\` 转义由 `\\.` 处理，`...` 截断标记不匹配任何分支，自然跳过。
+    // 之前只认 `(\d+)\s*'...'`——cppvsdbg 用 `,x` / `,2048,x` 给完整 dump 时条目是
+    // `0xNN` 这种裸 hex 形态，旧正则一个都匹配不上，导致全量 dump 被当成"不是 dump"。
+    const entryRe = /(?:(0x[0-9a-fA-F]+|\d+)\s*)?'(?:\\.|[^'\\])*'|(0x[0-9a-fA-F]+|\d+)/g;
     const bytes: number[] = [];
+    let invalid = false;
     let entryMatch: RegExpExecArray | null;
     while ((entryMatch = entryRe.exec(body)) !== null) {
-        const fullEntry = entryMatch[0];
-        const units = parseCharUnits(fullEntry);
-        if (!units) { return undefined; }
-        for (const u of units) {
-            if (u > 0xff) { return undefined; }
-            bytes.push(u);
+        const numeric = entryMatch[1] ?? entryMatch[2];
+        if (numeric !== undefined) {
+            const n = /^0x/i.test(numeric) ? parseInt(numeric.slice(2), 16) : parseInt(numeric, 10);
+            if (!(n >= 0 && n <= 0xff)) { invalid = true; break; }
+            bytes.push(n);
+        } else {
+            // 裸 glyph：交给 parseCharUnits 解出码点（支持 `'\xE4\xB8\xAD'` 多字节形态）。
+            const units = parseCharUnits(entryMatch[0]);
+            if (!units) { invalid = true; break; }
+            for (const u of units) {
+                if (u > 0xff) { invalid = true; break; }
+                bytes.push(u);
+            }
+            if (invalid) { break; }
         }
     }
+    if (invalid) { return undefined; }
     if (bytes.length === 0) { return undefined; }
     return bytes;
 }
@@ -224,14 +254,15 @@ export function parseCppvsdbgByteDumpEntries(value: string): readonly ByteDumpEn
     if (!m) { return []; }
     const body = m[1];
     if (body.trim() === '') { return []; }
-    const entries = body.split(',').map(s => s.trim()).filter(s => s.length > 0);
+    // 用跟 parseCppvsdbgByteDump 相同的 per-entry 正则切分，而不是在 `,` 上 split——
+    // 字节 0x2c 会被 cppvsdbg 渲染成 `44 ','`，glyph 里的 `,` 会被 split 切成两半。
+    // 正则只匹配 entry，`...` 截断标记自然跳过。
+    const entryRe = /(?:(0x[0-9a-fA-F]+|\d+)\s*)?'(?:\\.|[^'\\])*'|(0x[0-9a-fA-F]+|\d+)/g;
     const out: ByteDumpEntry[] = [];
     let index = 0;
-    for (const entry of entries) {
-        if (entry === '...') { continue; }
-        // 防御性：cppvsdbg 把多字节 UTF-8 塞进一个 entry 的情况（`'\xE4\xBD\xA0'`），
-        // 已经合并的当作单个 entry 处理即可；后续不需要把 `<decimal> '<glyph>'` 拆分。
-        out.push({ name: `[${index}]`, value: entry, type: 'std::byte' });
+    let entryMatch: RegExpExecArray | null;
+    while ((entryMatch = entryRe.exec(body)) !== null) {
+        out.push({ name: `[${index}]`, value: entryMatch[0], type: 'std::byte' });
         index++;
     }
     return out;
@@ -461,6 +492,10 @@ async function iterateByteBufferChildren(
         `${variable.evaluateName}[${i}],x`,
         `((uint8_t*)&${variable.evaluateName})[${i}]`,
     ];
+    // 连续 miss 计数：单个索引失败（0x00 字节偶发返回空 result）不再直接 break，
+    // 要连续 miss 足够多次才判定 cppvsdbg 真的不再应答。否则 byte[2048] 这种
+    // 数组会在第一个空结果处被截成 ~10 条，剩下的 2038 个字节全丢。
+    let consecutiveMisses = 0;
     for (let i = 0; i < inferredSize; i++) {
         if (context.count >= context.limits.maxVariables) { break; }
         if (context.token?.isCancellationRequested) { throw new ReaderCancellationError(); }
@@ -490,12 +525,16 @@ async function iterateByteBufferChildren(
                 if (error instanceof ReaderCancellationError) { throw error; }
             }
         }
-        if (!stored && i > 9) {
-            // cppvsdbg 对前 10 个索引跟 IDE preview dump 一样能答；之后突然全失败
-            // （indexedItems 没拿到，又超出 cppvsdbg 的 per-index 上限），继续打
-            // 也是浪费 round trip——靠 indexedItems 才知道是真的 overflow 了，否则
-            // 直接 break 把后面让给 byte-dump fallback 的 10 条 entry。
-            break;
+        if (stored) {
+            consecutiveMisses = 0;
+        } else {
+            consecutiveMisses++;
+            // 前 10 个索引 cppvsdbg 跟 IDE preview dump 一样总能答；之后允许最多
+            // MAX_CONSECUTIVE_MISSES 个连续 miss 再停，避免把"只是刚好失败一条"
+            // 误判成"per-index 上限到了"。
+            if (consecutiveMisses >= MAX_CONSECUTIVE_MISSES && i > 9) {
+                break;
+            }
         }
     }
 
@@ -575,8 +614,18 @@ async function tryEvaluateForFullByteDump(
 ): Promise<readonly number[] | undefined> {
     if (!variable.evaluateName) { return undefined; }
     const sizeHint = getIndexedCount(variable) ?? parseSizeFromType(variable.type) ?? 2048;
+    // MSVC format specifier 表达式，按"最容易让 cppvsdbg dump 全量"排序：
+    //   - `,N` 尺寸提示对 std::byte[N] 数组多数版本有效，把 ~10 条 preview 扩成 N 条；
+    //   - `,N,x` 同尺寸 + hex 渲染（条目是 `0xNN` 裸 hex，parseCppvsdbgByteDump 已支持）；
+    //   - `(unsigned char*)name,N[,x]`——`,N` 只对指针类表达式生效时，显式指针 cast
+    //     让 cppvsdbg 把它当 N 元素数组渲染；
+    //   - `,x` / `,!` / `,s8` / 裸名 作为后续兜底。
     const expressions = [
         `${variable.evaluateName},${sizeHint}`,
+        `${variable.evaluateName},${sizeHint},x`,
+        `(unsigned char*)${variable.evaluateName},${sizeHint}`,
+        `(unsigned char*)${variable.evaluateName},${sizeHint},x`,
+        `${variable.evaluateName},x`,
         `${variable.evaluateName},!`,
         `${variable.evaluateName},s8`,
         variable.evaluateName,
@@ -596,6 +645,8 @@ async function tryEvaluateForFullByteDump(
             if (bytes && bytes.length > bestDumpSize) {
                 bestDump = bytes;
                 bestDumpSize = bytes.length;
+                // 已经拿到预期尺寸的全量 dump，后面的表达式不用再试了。
+                if (bestDumpSize >= sizeHint) { break; }
             }
         } catch (error) {
             if (error instanceof ReaderCancellationError) { throw error; }
@@ -604,6 +655,183 @@ async function tryEvaluateForFullByteDump(
     // 64 bytes 阈值：默认 preview 给 ~10 条 entry，远低于 64；只有真的把
     // 完整 buffer dump 出来才会过这条线（PMR demo 是 2048 bytes，肯定过）。
     return bestDumpSize >= 64 ? bestDump : undefined;
+}
+
+/**
+ * 从 DAP `variablesReference` 分页收集 `[0]..[N-1]` 的字节 children。
+ *
+ * 收集到足够条目才返回 map（< min(64, sizeHint) 视为半截 preview 的 ref，
+ * 返回 undefined 让调用方继续走 per-index / dump fallback，避免把截断结果
+ * 当成全量）。每个 child 的 `name` 必须形如 `[N]`（或裸 `N`），`value` 保留
+ * adapter 给的 `<decimal> '<glyph>'` 形态。
+ */
+async function collectByteChildrenFromRef(
+    ref: number,
+    sizeHint: number,
+    context: ReaderContext,
+): Promise<Record<string, DapVariableNode> | undefined> {
+    const children: Record<string, DapVariableNode> = {};
+    let collected = 0;
+    for (let start = 0; start < sizeHint; start += context.limits.pageSize) {
+        if (context.token?.isCancellationRequested) { throw new ReaderCancellationError(); }
+        if (context.count >= context.limits.maxVariables) { break; }
+        const count = Math.min(context.limits.pageSize, sizeHint - start);
+        let response: { variables?: DapVariable[] };
+        try {
+            response = await request<{ variables?: DapVariable[] }>(
+                context.session, 'variables',
+                { variablesReference: ref, start, count },
+            );
+        } catch (error) {
+            if (error instanceof ReaderCancellationError) { throw error; }
+            break;
+        }
+        const vars = (response.variables ?? []).filter(isDapVariable);
+        if (vars.length === 0) { break; }
+        for (const child of vars) {
+            if (context.count >= context.limits.maxVariables) { break; }
+            const m = /^\[?(\d+)\]?$/.exec(child.name);
+            if (!m) { continue; }
+            context.count++;
+            collected++;
+            children[`[${m[1]}]`] = {
+                name: `[${m[1]}]`,
+                value: child.value,
+                type: child.type ?? 'std::byte',
+            };
+        }
+        if (vars.length < count) { break; }
+    }
+    if (collected === 0) { return undefined; }
+    // 阈值 64：cppvsdbg 的截断 preview 只给 ~10 条 entry，远低于 64；真正展开的
+    // 数组 ref 会给出全量（PMR demo 2048 条，肯定过线）。不足 64 视为半截 ref，
+    // 返回 undefined 让调用方继续走 per-index / dump fallback。小 buffer（如
+    // std::byte[4] 文本）也会落到 readStringValue 走文本解码，保持旧行为。
+    if (collected < 64) { return undefined; }
+    return children;
+}
+
+/**
+ * 解析单个 std::byte child 的 `value` 字符串为一个字节值。
+ *
+ * cppvsdbg 给 byte 数组子节点的 value 形态不固定：`24 '\x18'`、`0x18`、
+ * `184 '�'`、`0 '\0'`、`44 ','` 都见过。与 `parseCppvsdbgByteDump` 共用
+ * per-entry 正则，要求恰好解析出一个 0-255 的数值。
+ */
+function parseByteChildValue(value: string | undefined): number | undefined {
+    if (!value) { return undefined; }
+    const v = value.trim();
+    const entryRe = /(?:(0x[0-9a-fA-F]+|\d+)\s*)?'(?:\\.|[^'\\])*'|(0x[0-9a-fA-F]+|\d+)/g;
+    const matches: number[] = [];
+    let m: RegExpExecArray | null;
+    while ((m = entryRe.exec(v)) !== null) {
+        const numeric = m[1] ?? m[2];
+        if (numeric !== undefined) {
+            matches.push(/^0x/i.test(numeric) ? parseInt(numeric.slice(2), 16) : parseInt(numeric, 10));
+        } else {
+            const units = parseCharUnits(m[0]);
+            if (units) { matches.push(...units); }
+        }
+    }
+    if (matches.length !== 1) { return undefined; }
+    const n = matches[0]!;
+    return n >= 0 && n <= 0xff ? n : undefined;
+}
+
+/**
+ * 尝试把已物化的 byte children 合并成一个 value 字符串（string-like 叶子）。
+ *
+ * 按 `[0]..[N-1]` 顺序取每个 child 的字节值做 UTF-8 解码；任何缺口 / 无法
+ * 解析 / 解码出 U+FFFD 替换符（二进制内容）都返回 undefined，调用方退回
+ * 物化 children。收集少于 `min(64, sizeHint)` 条时也返回 undefined，避免把
+ * cppvsdbg 的截断 preview 合并成"只有 10 字节"的误导性 value。
+ */
+function tryMergeByteChildrenIntoValue(
+    children: Record<string, DapVariableNode>,
+    sizeHint: number,
+): string | undefined {
+    const indexes = Object.keys(children)
+        .map(k => parseInt(k.replace(/[\[\]]/g, ''), 10))
+        .filter(n => Number.isInteger(n) && n >= 0)
+        .sort((a, b) => a - b);
+    if (indexes.length < Math.min(64, sizeHint)) { return undefined; }
+    const bytes: number[] = [];
+    let expected = 0;
+    for (const i of indexes) {
+        if (i !== expected) { return undefined; }
+        const child = children[`[${i}]`] ?? children[String(i)];
+        const b = parseByteChildValue(child?.value);
+        if (b === undefined) { return undefined; }
+        bytes.push(b);
+        expected++;
+    }
+    const decoded = new TextDecoder('utf-8').decode(new Uint8Array(bytes));
+    if (decoded.includes('\uFFFD')) { return undefined; }
+    return decoded;
+}
+
+/**
+ * byte buffer children 收尾：合并模式下字节能解码成文本就合成 `value`（叶子），
+ * 否则保留物化好的 children。调用前 `node.children` 必须已设置好。
+ */
+function finalizeByteChildren(
+    node: DapVariableNode,
+    sizeHint: number,
+    context: ReaderContext,
+): DapVariableNode {
+    if (context.limits.mergeByteBufferIntoValue && node.children) {
+        const merged = tryMergeByteChildrenIntoValue(node.children, sizeHint);
+        if (merged !== undefined) {
+            node.value = merged;
+            delete node.children;
+            return node;
+        }
+    }
+    delete node.value;
+    return node;
+}
+
+/**
+ * 通过 `evaluate` 拿一个可展开句柄，再用 `variables` 分页把全部字节 children 拉回。
+ *
+ * cppvsdbg 对 `std::byte[N]` 在 `variables` 首屏折叠（不带 variablesReference），
+ * 但对 `name,N` 这种尺寸提示的 evaluate 表达式会返回**可展开的 ref**——IDE Watch
+ * 里 `pmr_buf,2048` 就能展开看到 `[0]..[N-1]`（999 以上都能看到）。reader 拿到
+ * ref 后走 `collectByteChildrenFromRef` 分页，等价于 IDE 展开后的数据，比
+ * per-index evaluate 少几十倍 round trip。
+ *
+ * `name,N` 拿不到 ref 时退回 `name,N,!`、`name,!`、裸 `name`。
+ */
+async function readByteChildrenViaExpandableEvaluate(
+    variable: DapVariable,
+    context: ReaderContext,
+): Promise<Record<string, DapVariableNode> | undefined> {
+    if (!variable.evaluateName) { return undefined; }
+    const sizeHint = getIndexedCount(variable) ?? parseSizeFromType(variable.type) ?? 2048;
+    const expressions = [
+        `${variable.evaluateName},${sizeHint}`,
+        `${variable.evaluateName},${sizeHint},!`,
+        `${variable.evaluateName},!`,
+        variable.evaluateName,
+    ];
+    for (const expr of expressions) {
+        if (context.token?.isCancellationRequested) { throw new ReaderCancellationError(); }
+        let ref: number | undefined;
+        try {
+            const resp = await request<{ variablesReference?: number }>(
+                context.session, 'evaluate',
+                { expression: expr, context: 'watch' },
+            );
+            ref = resp.variablesReference;
+        } catch (error) {
+            if (error instanceof ReaderCancellationError) { throw error; }
+            continue;
+        }
+        if (!ref) { continue; }
+        const children = await collectByteChildrenFromRef(ref, sizeHint, context);
+        if (children) { return children; }
+    }
+    return undefined;
 }
 
 /**
@@ -683,39 +911,53 @@ export async function readVariableTree(variable: DapVariable, context: ReaderCon
             node.value = '';
             return node;
         }
-        // std::byte[N] / std::byte * 没拿 variablesReference 时（cppvsdbg 折叠形态）：
-        //   1) 优先：DAP `readMemory` 直接读 raw memory bytes（一次返回 base64，
-        //      拿到的是真正的 2048 字节——比走 variables 子节点还快）
-        //   2) 次优：evaluate 重新求值拿 expand-able 句柄，再走 readStringValue
-        // 两条都失败就回到通用字节 dump 兜底。
-        if (isByteBufferType(variable.type) && !variable.variablesReference) {
+        // std::byte[N] / std::byte *（cppvsdbg 折叠形态）：无论输入是否自带
+        // variablesReference，都要物化全部字节 children。按可靠性排序：
+        //   1) 输入自带 ref（cppvsdbg 对 byte 数组会给可展开 ref，只是 value 折叠
+        //      成 preview）→ 直接 variables 分页，等价于 IDE 展开后的数据
+        //   2) DAP readMemory 直接读 raw memory bytes
+        //   3) evaluate 拿全量 byte dump（`,N` / `,x` / 指针 cast 等）
+        //   4) evaluate 拿可展开 ref → variables 分页
+        //   5) per-index evaluate
+        // 全失败才回到通用字节 dump 兜底 / readStringValue 文本解码。
+        if (isByteBufferType(variable.type)) {
             if (context.token?.isCancellationRequested) { throw new ReaderCancellationError(); }
+            const sizeHint = getIndexedCount(variable) ?? parseSizeFromType(variable.type) ?? 2048;
+            // 各字节源先把 children 物化到 node 上，再用 finalizeByteChildren 收尾：
+            // 合并模式（mergeByteBufferIntoValue）下内容可解码成文本 → value 叶子，
+            // 二进制 / 非合并模式 → 保留 children。
+            if (variable.variablesReference) {
+                const fromRef = await collectByteChildrenFromRef(variable.variablesReference, sizeHint, context);
+                if (fromRef) {
+                    node.children = fromRef;
+                    return finalizeByteChildren(node, sizeHint, context);
+                }
+            }
             if (variable.memoryReference) {
                 const memCount = getIndexedCount(variable) ?? 4096;
                 const memBytes = await readMemoryBytes(variable.memoryReference, memCount, context);
                 if (memBytes && memBytes.length > 0) {
-                    return nodeWithByteChildren(node, Array.from(memBytes), getIndexedCount(variable), context);
+                    nodeWithByteChildren(node, Array.from(memBytes), sizeHint, context);
+                    return finalizeByteChildren(node, sizeHint, context);
                 }
             }
-            // readMemory 拿不到（DAP `data` 字段未实现 / adapter 不支持）的兜底：
-            // 调 DAP `evaluate` 试若干 MSVC format specifier（`,N` 数组尺寸、
-            // `,!` raw 格式、`,s8` UTF-8 字符串），任一返回非平凡的 byte dump
-            // 就物化成 N 个 child。
             const dump = await tryEvaluateForFullByteDump(variable, context);
             if (dump && dump.length > 0) {
-                return nodeWithByteChildren(node, dump, dump.length, context);
+                // sizeHint 用 type / indexedItems 里的数组尺寸而不是 dump.length：
+                // cppvsdbg 的 `,N` dump 偶发在数组边界外多给几条 payload，多出来的
+                // 应该截掉，而不是把 [sizeHint] 之后的额外字节当成数组内容。
+                nodeWithByteChildren(node, dump, sizeHint, context);
+                return finalizeByteChildren(node, sizeHint, context);
             }
-            // readMemory / evaluate-refresh 都拿不到完整 2048 字节的话，
-            // 退到 per-index evaluate：cppvsdbg 在 IDE 内部展开时用
-            // `${name}[i]` 这种 round-trip 拉所有 2048 个字节。我们也走同样的
-            // 语义，慢但确定（最多 2048 个 DAP round-trip，受 maxVariables /
-            // cancellation 约束）。中途失败或被取消就退回到 truncated dump
-            // 那 ~10 条 virtual children。
+            const expanded = await readByteChildrenViaExpandableEvaluate(variable, context);
+            if (expanded) {
+                node.children = expanded;
+                return finalizeByteChildren(node, sizeHint, context);
+            }
             const iterated = await iterateByteBufferChildren(variable, context);
             if (iterated) {
                 node.children = iterated;
-                delete node.value;
-                return node;
+                return finalizeByteChildren(node, sizeHint, context);
             }
         }
         if (variable.variablesReference) {

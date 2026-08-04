@@ -12,7 +12,7 @@ export function makeSessionWithType(type: string, impl: CustomRequest): vscode.D
 	return { type, customRequest: impl } as unknown as vscode.DebugSession;
 }
 
-export const DEFAULT_LIMITS: ReaderLimits = { maxDepth: 8, maxVariables: 10000, maxArrayItems: 1000, pageSize: 100 };
+export const DEFAULT_LIMITS: ReaderLimits = { maxDepth: 8, maxVariables: 10000, maxArrayItems: 1000, pageSize: 100, mergeByteBufferIntoValue: true };
 
 export function makeContext(session: vscode.DebugSession, overrides: Partial<ReaderLimits> = {}, token?: vscode.CancellationToken) {
 	return { session, limits: { ...DEFAULT_LIMITS, ...overrides }, token, count: 0, references: new Set<number>() };

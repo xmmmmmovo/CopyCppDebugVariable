@@ -269,10 +269,11 @@ suite('readVariableTree', () => {
 		assert.strictEqual(decoded.length, total, 'all 2048 bytes must round-trip through UTF-8 decode (modulo control bytes lost as Unicode replacements)');
 	});
 
-	test('pmr_buf-style byte buffer reconstructs past maxArrayItems through DAP variables', async () => {
-		// 端到端：模拟 demo 里 pmr_buf（std::byte[2048]，cppvsdbg 给完整 N 个 byte 子节点），
-		// readVariableTree 必须把所有 2048 字节拼回来，不能在被 maxArrayItems 卡住后退化成
-		// 半截 cppvsdbg 字节 dump 预览。
+	test('pmr_buf-style byte buffer materialises all N children past maxArrayItems via its variablesReference', async () => {
+		// 端到端：模拟 demo 里 pmr_buf（std::byte[2048]，cppvsdbg 给完整 N 个 byte 子节点、
+		// 且输入自带 variablesReference）。reader 必须直接把该 ref 分页物化成全部 2048 个
+		// children，不能在被 maxArrayItems 卡住后退化成半截 cppvsdbg 字节 dump 预览，
+		// 也不该走 readStringValue 把二进制当 UTF-8 文本解码。
 		const total = 2048;
 		const bytes = new Uint8Array(total);
 		// 头一段塞点非零内容模拟 PMR 池里实际写入的字节
@@ -292,9 +293,13 @@ suite('readVariableTree', () => {
 			{ name: 'pmr_buf', value: "0x000000a7692fe820 {..., ...}", type: 'std::byte[2048]', variablesReference: 7, indexedItems: total },
 			makeContext(session, { pageSize: 100, maxArrayItems: 1000 }),
 		);
-		assert.ok(node.value, 'pmr_buf should rebuild a value out of all 2048 byte children, not the truncated preview');
+		assert.strictEqual(node.value, undefined, 'byte buffer must not carry a decoded value when children are materialized');
 		assert.strictEqual(node.type, 'std::byte[2048]');
-		assert.strictEqual(node.children, undefined);
+		assert.ok(node.children, 'pmr_buf should expose all 2048 byte children, not the truncated preview');
+		assert.strictEqual(Object.keys(node.children ?? {}).length, total, 'all 2048 bytes must be present');
+		assert.strictEqual(node.children?.['[0]']?.value, `${bytes[0]} 'x'`);
+		assert.strictEqual(node.children?.['[1024]']?.value, `${bytes[1024]} 'x'`);
+		assert.strictEqual(node.children?.['[2047]']?.value, `${bytes[2047]} 'x'`);
 	});
 
 	test('materialises folded std::byte[N] via DAP evaluate using MSVC format specifiers', async () => {
@@ -393,11 +398,261 @@ suite('readVariableTree', () => {
 		assert.strictEqual(node.children?.['[2047]']?.value, `${bytes[2047]} 'x'`);
 	});
 
+	test('materialises full byte buffer from cppvsdbg hex dump via ,N spec', async () => {
+		// cppvsdbg 对 `,2048` 可能返回全量 HEX dump（条目是 `0xNN`，不是
+		// `<dec> '<glyph>'`）。旧 parseCppvsdbgByteDump 只认 `<dec> '<glyph>'`，
+		// 这种 0xNN 裸 hex 一条都匹配不上 → 全量 dump 被当成"不是 dump"，reader
+		// 又退化回 ~10 条 preview。现在必须把 2048 条 hex 全部物化成 child。
+		const total = 2048;
+		const bytes = new Uint8Array(total);
+		for (let i = 0; i < total; i++) { bytes[i] = (i * 7 + 1) & 0xff; }
+		const calls: string[] = [];
+		const session = makeSession(async (cmd, args) => {
+			calls.push(cmd);
+			if (cmd === 'evaluate') {
+				const expr = (args as { expression: string }).expression;
+				if (expr.includes(',2048')) {
+					const entries = Array.from(bytes, (b) => `0x${b.toString(16).padStart(2, '0')}`);
+					return { result: `0x000000DE57EFEC80 {${entries.join(', ')}}`, type: 'std::byte[2048]' };
+				}
+				return { result: '', type: 'std::byte[2048]' };
+			}
+			return {};
+		});
+		const node = await readVariableTree(
+			{
+				name: 'pmr_buf',
+				value: "0x000000DE57EFEC80 {24 '\\x18', ..., ...}",
+				type: 'std::byte[2048]',
+				evaluateName: 'strings.pmr_buf',
+				memoryReference: '0x000000DE57EFEC80',
+			},
+			makeContext(session),
+		);
+		assert.ok(calls.includes('evaluate'));
+		assert.strictEqual(node.value, undefined, 'byte buffer must not carry both value and children');
+		assert.ok(node.children);
+		assert.strictEqual(Object.keys(node.children ?? {}).length, total, `must expose all ${total} bytes from hex dump`);
+		assert.strictEqual(node.children?.['[0]']?.value, formatByteAsCppvsdbg(bytes[0]!));
+		assert.strictEqual(node.children?.['[1024]']?.value, formatByteAsCppvsdbg(bytes[1024]!));
+		assert.strictEqual(node.children?.['[2047]']?.value, formatByteAsCppvsdbg(bytes[2047]!));
+	});
+
+	test('materialises full byte buffer via explicit pointer-cast evaluate when ,N on array is ignored', async () => {
+		// MSVC 的 `,N` 尺寸提示只对"指针类"表达式生效。cppvsdbg 对 `std::byte[2048]`
+		// 数组可能忽略 `,2048`（仍回 truncated preview），但对显式指针 cast
+		// `(unsigned char*)name,2048` 会当 N 元素数组渲染全量。reader 必须尝试
+		// 指针 cast 这条路径。
+		const total = 2048;
+		const bytes = new Uint8Array(total);
+		for (let i = 0; i < total; i++) { bytes[i] = (i * 3 + 5) & 0xff; }
+		const calls: string[] = [];
+		const session = makeSession(async (cmd, args) => {
+			calls.push(cmd);
+			if (cmd === 'evaluate') {
+				const expr = (args as { expression: string }).expression;
+				if (expr.startsWith('(unsigned char*)strings.pmr_buf,2048')) {
+					const entries = Array.from(bytes, (b) => `${b}`);
+					return { result: `0x000000DE57EFEC80 {${entries.join(', ')}}`, type: 'std::byte[2048]' };
+				}
+				if (expr.includes(',2048') || expr.endsWith(',!') || expr.endsWith(',s8')) {
+					return { result: "0x000000DE57EFEC80 {24 '\\x18', 232 '�', ..., ...}", type: 'std::byte[2048]' };
+				}
+				return { result: "0x000000DE57EFEC80 {24 '\\x18', 232 '�', ..., ...}", type: 'std::byte[2048]' };
+			}
+			return {};
+		});
+		const node = await readVariableTree(
+			{
+				name: 'pmr_buf',
+				value: "0x000000DE57EFEC80 {24 '\\x18', ..., ...}",
+				type: 'std::byte[2048]',
+				evaluateName: 'strings.pmr_buf',
+				memoryReference: '0x000000DE57EFEC80',
+			},
+			makeContext(session),
+		);
+		assert.ok(calls.includes('evaluate'), 'must consult evaluate when readMemory is unavailable');
+		assert.strictEqual(node.value, undefined);
+		assert.ok(node.children);
+		assert.strictEqual(Object.keys(node.children ?? {}).length, total, 'must expose all bytes from pointer-cast dump');
+		assert.strictEqual(node.children?.['[0]']?.value, formatByteAsCppvsdbg(bytes[0]!));
+		assert.strictEqual(node.children?.['[2047]']?.value, formatByteAsCppvsdbg(bytes[2047]!));
+	});
+
+	test('materialises full byte buffer via expandable variablesReference from ,N evaluate', async () => {
+		// cppvsdbg 对 `pmr_buf,2048` 的 evaluate 响应带可展开 variablesReference
+		// （IDE Watch 里 `pmr_buf,2048` 展开能看到 [0]..[N-1]），但 value 字符串
+		// 仍是截断 preview——reader 之前只解析 result 字符串，漏掉了 ref 这条线。
+		// 现在拿到 ref 后走 variables 分页，把全部 N 个字节 child 拉回来。
+		const total = 2048;
+		const bytes = new Uint8Array(total);
+		for (let i = 0; i < total; i++) { bytes[i] = (i * 13 + 9) & 0xff; }
+		const calls: string[] = [];
+		const session = makeSession(async (cmd, args) => {
+			calls.push(cmd);
+			if (cmd === 'evaluate') {
+				const expr = (args as { expression: string }).expression;
+				if (expr.includes(',2048')) {
+					return {
+						result: "0x000000DE57EFEC80 {24 '\\x18', 233 '�', 239 '�', 124 '|', 163 '�', ..., ...}",
+						type: 'std::byte[2048]',
+						variablesReference: 5000,
+					};
+				}
+				return { result: '', type: 'std::byte[2048]' };
+			}
+			if (cmd === 'variables' && (args as { variablesReference: number }).variablesReference === 5000) {
+				const a = args as { start: number; count: number };
+				const items = Array.from({ length: Math.min(a.count, total - a.start) }, (_, i) => ({
+					name: `[${a.start + i}]`,
+					value: formatByteAsCppvsdbg(bytes[a.start + i]!),
+					type: 'std::byte',
+					variablesReference: 0,
+				}));
+				return { variables: items };
+			}
+			return {};
+		});
+		const node = await readVariableTree(
+			{
+				name: 'pmr_buf',
+				value: "0x000000DE57EFEC80 {24 '\\x18', ..., ...}",
+				type: 'std::byte[2048]',
+				evaluateName: 'strings.pmr_buf',
+				memoryReference: '0x000000DE57EFEC80',
+			},
+			makeContext(session, { pageSize: 100, maxArrayItems: 1000 }),
+		);
+		assert.ok(calls.includes('variables'), 'must page the expandable reference via variables');
+		assert.strictEqual(node.value, undefined, 'byte buffer must not carry both value and children');
+		assert.ok(node.children);
+		assert.strictEqual(Object.keys(node.children ?? {}).length, total, 'must expose all bytes from the paged reference');
+		assert.strictEqual(node.children?.['[0]']?.value, formatByteAsCppvsdbg(bytes[0]!));
+		assert.strictEqual(node.children?.['[1024]']?.value, formatByteAsCppvsdbg(bytes[1024]!));
+		assert.strictEqual(node.children?.['[2047]']?.value, formatByteAsCppvsdbg(bytes[2047]!));
+	});
+
+	test('per-index evaluate tolerates isolated empty results without truncating at ~10', async () => {
+		// cppvsdbg 对 `strings.pmr_buf[i]` 单条索引偶发返回空 result（典型 0x00 字节）。
+		// 旧逻辑在 i=10 遇到一次 miss 就 break，把 byte[2048] 截成 [0]-[9] 10 个 child；
+		// 新逻辑要求连续 miss 才停，单次 miss 不影响后续 11..2047 的拉取。
+		const total = 2048;
+		const bytes = new Uint8Array(total);
+		for (let i = 0; i < total; i++) { bytes[i] = i & 0xff; }
+		const calls: string[] = [];
+		const session = makeSession(async (cmd, args) => {
+			calls.push(cmd);
+			if (cmd === 'evaluate') {
+				const expr = (args as { expression: string }).expression;
+				const m = /\[(\d+)\]/.exec(expr);
+				const i = m ? parseInt(m[1], 10) : -1;
+				if (i === 10) { return { result: '', type: 'std::byte' }; }
+				if (i >= 0 && i < total) { return { result: `${bytes[i]} 'x'`, type: 'std::byte' }; }
+				return { result: "0x... {..., ...}", type: 'std::byte[2048]' };
+			}
+			return {};
+		});
+		const node = await readVariableTree(
+			{
+				name: 'pmr_buf',
+				value: "0x0000004BB7AFE7A0 {216 '�', 230 '�', ..., ...}",
+				type: 'std::byte[2048]',
+				evaluateName: 'strings.pmr_buf',
+				memoryReference: '0x0000004BB7AFE7A0',
+				indexedItems: total,
+			},
+			makeContext(session, { pageSize: 100, maxArrayItems: 1000 }),
+		);
+		// 索引 10 之外的 2047 个字节都应该拿到（[10] 缺失是适配器不给，不是 reader 截断）。
+		assert.strictEqual(Object.keys(node.children ?? {}).length, total - 1);
+		assert.strictEqual(node.children?.['[9]']?.value, `${bytes[9]} 'x'`);
+		assert.strictEqual(node.children?.['[11]']?.value, `${bytes[11]} 'x'`);
+		assert.strictEqual(node.children?.['[2047]']?.value, `${bytes[2047]} 'x'`);
+		assert.ok(calls.length < total * 3, 'loop must not run unbounded');
+	});
+
+	test('merges text byte buffer into a value string when mergeByteBufferIntoValue is on', async () => {
+		// pmr_buf 是 string-like：字节能解码成文本（PMR 池里就是字符串数据）时，
+		// 合并成单个 value 字符串（叶子），而不是摊开 N 个 byte children。
+		const text = 'PMR string served from a monotonic buffer. '.repeat(3);
+		const bytes = new TextEncoder().encode(text);
+		const total = bytes.length;
+		const session = makeSession(async (cmd, args) => {
+			if (cmd !== 'variables') { return {}; }
+			const a = args as { start: number; count: number };
+			const items = Array.from({ length: Math.min(a.count, total - a.start) }, (_, i) => ({
+				name: `[${a.start + i}]`,
+				value: `${bytes[a.start + i]} 'x'`,
+				type: 'std::byte',
+				variablesReference: 0,
+			}));
+			return { variables: items };
+		});
+		const node = await readVariableTree(
+			{ name: 'pmr_buf', value: '0x... {..., ...}', type: `std::byte[${total}]`, variablesReference: 7, indexedItems: total },
+			makeContext(session, { pageSize: 100 }),
+		);
+		assert.strictEqual(node.value, text, 'text byte buffer should merge into value');
+		assert.strictEqual(node.children, undefined, 'merged byte buffer must be a leaf');
+	});
+
+	test('keeps binary byte buffer as children when mergeByteBufferIntoValue is on', async () => {
+		// 二进制内容（解码出 U+FFFD 替换符）不能合并成文本 → 退回物化全部字节 children。
+		const total = 2048;
+		const bytes = new Uint8Array(total);
+		for (let i = 0; i < total; i++) { bytes[i] = (i * 7 + 1) & 0xff; } // 含大量无效 UTF-8
+		const session = makeSession(async (cmd, args) => {
+			if (cmd !== 'variables') { return {}; }
+			const a = args as { start: number; count: number };
+			const items = Array.from({ length: Math.min(a.count, total - a.start) }, (_, i) => ({
+				name: `[${a.start + i}]`,
+				value: `${bytes[a.start + i]} 'x'`,
+				type: 'std::byte',
+				variablesReference: 0,
+			}));
+			return { variables: items };
+		});
+		const node = await readVariableTree(
+			{ name: 'pmr_buf', value: '0x... {..., ...}', type: 'std::byte[2048]', variablesReference: 7, indexedItems: total },
+			makeContext(session, { pageSize: 100 }),
+		);
+		assert.strictEqual(node.value, undefined, 'binary byte buffer must not merge into a garbage value');
+		assert.ok(node.children);
+		assert.strictEqual(Object.keys(node.children ?? {}).length, total);
+	});
+
+	test('materialises text byte buffer as children when mergeByteBufferIntoValue is off', async () => {
+		// 关闭合并：即使内容是文本，也一律物化成全部字节 children。
+		const text = 'Hello'.repeat(20);
+		const bytes = new TextEncoder().encode(text);
+		const total = bytes.length;
+		const session = makeSession(async (cmd, args) => {
+			if (cmd !== 'variables') { return {}; }
+			const a = args as { start: number; count: number };
+			const items = Array.from({ length: Math.min(a.count, total - a.start) }, (_, i) => ({
+				name: `[${a.start + i}]`,
+				value: `${bytes[a.start + i]} 'x'`,
+				type: 'std::byte',
+				variablesReference: 0,
+			}));
+			return { variables: items };
+		});
+		const node = await readVariableTree(
+			{ name: 'pmr_buf', value: '0x... {..., ...}', type: `std::byte[${total}]`, variablesReference: 7, indexedItems: total },
+			makeContext(session, { pageSize: 100, mergeByteBufferIntoValue: false }),
+		);
+		assert.strictEqual(node.value, undefined);
+		assert.ok(node.children);
+		assert.strictEqual(Object.keys(node.children ?? {}).length, total);
+	});
+
 	test('falls back to truncated dump entries when per-index evaluate fails', async () => {
-		// per-index evaluate 也失败时（cppvsdbg 把 `${name}[i]` 直接 reject），退回
+		// per-index evaluate 也失败时（cppvsdbg 把 `${name}[i]` 全返回空 result），退回
 		// truncated dump 那 10 条 entry 作为虚拟 children——这是接口能拿到的所有数据。
+		let evaluateCalls = 0;
 		const session = makeSession(async (cmd) => {
-			if (cmd === 'evaluate') { return { result: '', type: 'std::byte[2048]' }; }
+			if (cmd === 'evaluate') { evaluateCalls++; return { result: '', type: 'std::byte[2048]' }; }
 			return {};
 		});
 		const raw = "0x0000004BB7AFE7A0 {56 '8', 231 '', 156 '', 135 '', 75 'K', 0 '\\0', 0 '\\0', 0 '\\0', 0 '\\0', 0 '\\0', ..., ...}";
@@ -413,12 +668,16 @@ suite('readVariableTree', () => {
 		);
 		assert.strictEqual(node.value, undefined, 'byte buffer must not carry both value and children');
 		assert.ok(node.children);
-		// per-index evaluate 全返回空 result → 第一条就 break，accumulator 永远为空；
-		// iterateByteBufferChildren 返回 undefined → 落到 byte dump fallback。
+		// per-index evaluate 全返回空 result → 连续 miss 计数到上限后 break，accumulator
+		// 永远为空；iterateByteBufferChildren 返回 undefined → 落到 byte dump fallback。
 		assert.strictEqual(Object.keys(node.children ?? {}).length, 10);
 		assert.strictEqual(node.children?.['[0]']?.value, "56 '8'");
 		assert.strictEqual(node.children?.['[4]']?.value, "75 'K'");
 		assert.strictEqual(node.children?.['[5]']?.value, "0 '\\0'");
+		// 连续 miss 提前 break 必须拦住 round trip：不能把 2048 条索引 × 3 种表达式
+		// 全打满。这里 evaluate 总量（format-spec 尝试 + per-index 连续 miss 上限）
+		// 应远小于 2048。
+		assert.ok(evaluateCalls < 200, `evaluate must be bounded, got ${evaluateCalls}`);
 	});
 
 	test('non-byte string-like still decodes cppvsdbg byte dump to UTF-8', async () => {
@@ -510,7 +769,7 @@ suite('readVariableTree', () => {
 		});
 		const node = await readVariableTree(
 			{ name: 'b', type: 'std::byte[3]', memoryReference: '0x1', value: '' },
-			makeContext(session),
+			makeContext(session, { mergeByteBufferIntoValue: false }),
 		);
 		assert.strictEqual(Object.keys(node.children ?? {}).length, 3);
 		assert.strictEqual(node.children?.['[0]']?.value, `65 'A'`);
@@ -568,7 +827,7 @@ suite('readVariableTree', () => {
 		});
 		const node = await readVariableTree(
 			{ name: 'b', type: 'std::byte[2]', memoryReference: '0x1', value: '' },
-			makeContext(session),
+			makeContext(session, { mergeByteBufferIntoValue: false }),
 		);
 		assert.strictEqual(Object.keys(node.children ?? {}).length, 2);
 		assert.strictEqual(node.memoryReference, '0x1', 'original memoryReference should be preserved');
@@ -973,9 +1232,38 @@ suite('parseCppvsdbgByteDump', () => {
 		assert.strictEqual(parseCppvsdbgByteDump(''), undefined);
 	});
 
-	test('returns undefined when any entry cannot be parsed', () => {
-		// "{0}" 单独一个数字没有 glyph 形式，parseCharUnits 解析不了。
-		assert.strictEqual(parseCppvsdbgByteDump('{0, 1, 2}'), undefined);
+	test('parses bare decimal entries without glyphs (hex/dec array views)', () => {
+		// cppvsdbg 用 `,x` / `,N` 给完整 dump 时条目可能是裸数字（无 glyph）——
+		// `{0, 1, 2}` 表示 3 个字节，不是"无法解析"。
+		assert.deepStrictEqual(parseCppvsdbgByteDump('{0, 1, 2}'), [0, 1, 2]);
+	});
+
+	test('parses bare hex entries (cppvsdbg ,x / ,N,x dump form)', () => {
+		assert.deepStrictEqual(
+			parseCppvsdbgByteDump('{0x18, 0xe8, 0xef, 0x57, 0x00}'),
+			[0x18, 0xe8, 0xef, 0x57, 0x00],
+		);
+	});
+
+	test('parses mixed decimal / hex / glyph-only entries', () => {
+		assert.deepStrictEqual(
+			parseCppvsdbgByteDump("{24 '\\x18', 0xe8, 97 'a', '\\x00'}"),
+			[24, 0xe8, 97, 0x00],
+		);
+	});
+
+	test('keeps glyph containing comma / backslash / quote as a single entry', () => {
+		// 0x2c 渲染成 `44 ','`、0x5c 渲染成 `92 '\\'`、0x27 渲染成 `39 '\\''`——
+		// glyph 里的 `,` 不能把 entry 切成两半，`\\` 和 `\'` 是转义而不是结束符。
+		assert.deepStrictEqual(
+			parseCppvsdbgByteDump("{44 ',', 92 '\\\\', 39 '\\''}"),
+			[44, 92, 39],
+		);
+	});
+
+	test('returns undefined when any entry is out of byte range or unparseable', () => {
+		assert.strictEqual(parseCppvsdbgByteDump('{256}'), undefined);
+		assert.strictEqual(parseCppvsdbgByteDump('{abc}'), undefined);
 	});
 });
 

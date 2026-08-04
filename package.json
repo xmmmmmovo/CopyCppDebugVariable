@@ -100,6 +100,11 @@
           "type": "boolean",
           "default": false,
           "description": "Show a bottom-right notification after a successful copy / save. Off by default; warnings and errors are always shown."
+        },
+        "copy-cpp-debug-variable.mergeByteBufferIntoValue": {
+          "type": "boolean",
+          "default": true,
+          "description": "Merge std::byte[N] / std::byte * byte-buffer content into a single `value` string (string-like leaf), instead of exposing N byte children. When the bytes do not decode as valid UTF-8 (binary buffer), children are materialized anyway. Turn off to always materialize all byte children."
         }
       }
     }
