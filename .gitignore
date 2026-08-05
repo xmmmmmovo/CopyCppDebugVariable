@@ -4,3 +4,4 @@ dist
 out
 misc
 CLAUDE.md
+.claude/settings.local.json
