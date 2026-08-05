@@ -19,6 +19,7 @@
   "categories": [
     "Other"
   ],
+  "icon": "logo.ico",
   "main": "./dist/extension.js",
   "activationEvents": [
     "onDebug"
