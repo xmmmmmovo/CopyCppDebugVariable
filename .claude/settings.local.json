@@ -5,7 +5,8 @@
       "WebFetch(domain:code.visualstudio.com)",
       "WebSearch",
       "Bash(pnpm run *)",
-      "Bash(./node_modules/.bin/mocha)"
+      "Bash(./node_modules/.bin/mocha)",
+      "Bash(python -c \"import yaml,sys; [yaml.safe_load\\(open\\(f\\)\\) for f in ['.github/workflows/ci.yml','.github/workflows/release.yml']]; print\\('YAML OK'\\)\")"
     ]
   }
 }
